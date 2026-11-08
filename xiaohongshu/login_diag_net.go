@@ -47,6 +47,43 @@ var loginBlockedReasons = map[proto.NetworkBlockedReason]struct{}{
 	proto.NetworkBlockedReasonCorpNotSameOriginAfterDefaultedToSameOriginByCoepAndDip: {},
 }
 
+var loginCorsErrors = map[proto.NetworkCorsError]struct{}{
+	proto.NetworkCorsErrorDisallowedByMode:                          {},
+	proto.NetworkCorsErrorInvalidResponse:                           {},
+	proto.NetworkCorsErrorWildcardOriginNotAllowed:                  {},
+	proto.NetworkCorsErrorMissingAllowOriginHeader:                  {},
+	proto.NetworkCorsErrorMultipleAllowOriginValues:                 {},
+	proto.NetworkCorsErrorInvalidAllowOriginValue:                   {},
+	proto.NetworkCorsErrorAllowOriginMismatch:                       {},
+	proto.NetworkCorsErrorInvalidAllowCredentials:                   {},
+	proto.NetworkCorsErrorCorsDisabledScheme:                        {},
+	proto.NetworkCorsErrorPreflightInvalidStatus:                    {},
+	proto.NetworkCorsErrorPreflightDisallowedRedirect:               {},
+	proto.NetworkCorsErrorPreflightWildcardOriginNotAllowed:         {},
+	proto.NetworkCorsErrorPreflightMissingAllowOriginHeader:         {},
+	proto.NetworkCorsErrorPreflightMultipleAllowOriginValues:        {},
+	proto.NetworkCorsErrorPreflightInvalidAllowOriginValue:          {},
+	proto.NetworkCorsErrorPreflightAllowOriginMismatch:              {},
+	proto.NetworkCorsErrorPreflightInvalidAllowCredentials:          {},
+	proto.NetworkCorsErrorPreflightMissingAllowExternal:             {},
+	proto.NetworkCorsErrorPreflightInvalidAllowExternal:             {},
+	proto.NetworkCorsErrorPreflightMissingAllowPrivateNetwork:       {},
+	proto.NetworkCorsErrorPreflightInvalidAllowPrivateNetwork:       {},
+	proto.NetworkCorsErrorInvalidAllowMethodsPreflightResponse:      {},
+	proto.NetworkCorsErrorInvalidAllowHeadersPreflightResponse:      {},
+	proto.NetworkCorsErrorMethodDisallowedByPreflightResponse:       {},
+	proto.NetworkCorsErrorHeaderDisallowedByPreflightResponse:       {},
+	proto.NetworkCorsErrorRedirectContainsCredentials:               {},
+	proto.NetworkCorsErrorInsecurePrivateNetwork:                    {},
+	proto.NetworkCorsErrorInvalidPrivateNetworkAccess:               {},
+	proto.NetworkCorsErrorUnexpectedPrivateNetworkAccess:            {},
+	proto.NetworkCorsErrorNoCorsRedirectModeNotFollow:               {},
+	proto.NetworkCorsErrorPreflightMissingPrivateNetworkAccessID:    {},
+	proto.NetworkCorsErrorPreflightMissingPrivateNetworkAccessName:  {},
+	proto.NetworkCorsErrorPrivateNetworkAccessPermissionUnavailable: {},
+	proto.NetworkCorsErrorPrivateNetworkAccessPermissionDenied:      {},
+}
+
 // startLoginNetDiag 只在诊断打开时监听当前页的网络事件。关闭时不做任何 CDP 调用。
 // 返回的函数停止监听并写一行汇总。Image 事件为 0 不能说明没有二维码，data URL 和 canvas 不走这条事件。
 func startLoginNetDiag(pp *rod.Page) func() {
@@ -99,6 +136,7 @@ type loginNetStats struct {
 	errN   map[string]map[string]int
 	cancel map[string]int
 	block  map[string]map[string]int
+	cors   map[string]map[string]int
 	any    bool
 }
 
@@ -108,6 +146,7 @@ func newLoginNetStats() *loginNetStats {
 		errN:   map[string]map[string]int{},
 		cancel: map[string]int{},
 		block:  map[string]map[string]int{},
+		cors:   map[string]map[string]int{},
 	}
 }
 
@@ -130,6 +169,7 @@ func (s *loginNetStats) addFail(e *proto.NetworkLoadingFailed) {
 	kind := resourceKind(e.Type)
 	errToken := sanitizeNetErr(e.ErrorText)
 	block := sanitizeBlock(e.BlockedReason)
+	cors := sanitizeCors(e.CorsErrorStatus)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.any = true
@@ -142,6 +182,7 @@ func (s *loginNetStats) addFail(e *proto.NetworkLoadingFailed) {
 	if block != "" {
 		s.add(s.block, kind, block)
 	}
+	s.add(s.cors, kind, cors)
 }
 
 func (s *loginNetStats) add(dst map[string]map[string]int, kind, token string) {
@@ -182,6 +223,11 @@ func (s *loginNetStats) format() string {
 			extra = append(extra, name)
 		}
 	}
+	for name := range s.cors {
+		if _, ok := seen[name]; !ok {
+			extra = append(extra, name)
+		}
+	}
 	sort.Strings(extra)
 	for _, name := range extra {
 		if line := s.kindLine(name); line != "" {
@@ -198,14 +244,15 @@ func (s *loginNetStats) kindLine(kind string) string {
 	resp := s.resp[kind]
 	errN := s.errN[kind]
 	block := s.block[kind]
+	cors := s.cors[kind]
 	cancel := s.cancel[kind]
-	if len(resp) == 0 && len(errN) == 0 && len(block) == 0 && cancel == 0 {
+	if len(resp) == 0 && len(errN) == 0 && len(block) == 0 && len(cors) == 0 && cancel == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%s:2xx=%d,3xx=%d,4xx=%d,5xx=%d,other=%d,err=%s,cancel=%d,block=%s",
+	return fmt.Sprintf("%s:2xx=%d,3xx=%d,4xx=%d,5xx=%d,other=%d,err=%s,cancel=%d,block=%s,cors=%s",
 		kind,
 		resp["2xx"], resp["3xx"], resp["4xx"], resp["5xx"], resp["other"],
-		formatTokens(errN), cancel, formatTokens(block))
+		formatTokens(errN), cancel, formatTokens(block), formatTokens(cors))
 }
 
 func formatTokens(bucket map[string]int) string {
@@ -254,6 +301,16 @@ func sanitizeNetErr(text string) string {
 	}
 	if text == "" {
 		return ""
+	}
+	return "other"
+}
+
+func sanitizeCors(status *proto.NetworkCorsErrorStatus) string {
+	if status == nil {
+		return "none"
+	}
+	if _, ok := loginCorsErrors[status.CorsError]; ok {
+		return string(status.CorsError)
 	}
 	return "other"
 }

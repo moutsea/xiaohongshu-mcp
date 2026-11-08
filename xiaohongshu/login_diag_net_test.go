@@ -34,10 +34,46 @@ func TestLoginNetStatsSanitize(t *testing.T) {
 			t.Fatalf("日志含敏感或原始文本 %q: %s", secret, line)
 		}
 	}
-	for _, want := range []string{"Image:", "4xx=1", "net::ERR_ABORTED=1", "cancel=1", "csp=1", "other=1"} {
+	for _, want := range []string{"Image:", "4xx=1", "net::ERR_ABORTED=1", "cancel=1", "csp=1", "other=1", "cors=none=3"} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("缺少 %q: %s", want, line)
 		}
+	}
+}
+
+func TestLoginNetStatsCorsEnum(t *testing.T) {
+	stats := newLoginNetStats()
+	stats.addFail(&proto.NetworkLoadingFailed{
+		Type:      proto.NetworkResourceTypeFetch,
+		ErrorText: "net::ERR_FAILED",
+		CorsErrorStatus: &proto.NetworkCorsErrorStatus{
+			CorsError:       proto.NetworkCorsErrorMissingAllowOriginHeader,
+			FailedParameter: "https://secret.example SECRET_HEADER",
+		},
+	})
+	stats.addFail(&proto.NetworkLoadingFailed{
+		Type:      proto.NetworkResourceTypeFetch,
+		ErrorText: "net::ERR_FAILED",
+		CorsErrorStatus: &proto.NetworkCorsErrorStatus{
+			CorsError:       proto.NetworkCorsError("NotARealCorsError"),
+			FailedParameter: "SECRET_HEADER",
+		},
+	})
+	stats.addFail(&proto.NetworkLoadingFailed{
+		Type:      proto.NetworkResourceTypeXHR,
+		ErrorText: "net::ERR_FAILED",
+	})
+	line := stats.format()
+	for _, secret := range []string{"SECRET_HEADER", "secret.example", "https://", "NotARealCorsError", "FailedParameter"} {
+		if strings.Contains(line, secret) {
+			t.Fatalf("日志含原始字段 %q: %s", secret, line)
+		}
+	}
+	if !strings.Contains(line, "Fetch:") || !strings.Contains(line, "MissingAllowOriginHeader=1") || !strings.Contains(line, "other=1") {
+		t.Fatal(line)
+	}
+	if !strings.Contains(line, "XHR:") || !strings.Contains(line, "cors=none=1") {
+		t.Fatal(line)
 	}
 }
 

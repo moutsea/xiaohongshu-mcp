@@ -151,6 +151,42 @@ func TestLoginNetDiagCanceledImage(t *testing.T) {
 	require.NotContains(t, text, "cancel.png")
 }
 
+func TestLoginNetDiagCorsEnum(t *testing.T) {
+	t.Setenv("XHS_LOGIN_DIAG", "1")
+	const secret = "SECRET_TOKEN_DO_NOT_LOG"
+	const headerName = "X-Do-Not-Log"
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Secret", secret)
+		fmt.Fprint(w, secret)
+	}))
+	t.Cleanup(other.Close)
+	pageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `<!doctype html><html><body><script>
+			fetch(%q, {headers: {%q: %q}}).catch(() => {});
+		</script></body></html>`, other.URL+"/item?token="+secret, headerName, secret)
+	}))
+	t.Cleanup(pageSrv.Close)
+
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	hook := &logCapture{}
+	logrus.AddHook(hook)
+	t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks)) })
+	flush := startLoginNetDiag(page)
+	require.NoError(t, page.Timeout(5*time.Second).Navigate(pageSrv.URL))
+	time.Sleep(time.Second)
+	flush()
+	text := strings.Join(hook.lines, "\n")
+	require.Contains(t, text, "cors=PreflightMissingAllowOriginHeader=1")
+	require.Contains(t, text, "net::ERR_FAILED=1")
+	require.NotContains(t, text, secret)
+	require.NotContains(t, text, headerName)
+	require.NotContains(t, text, "failedParameter")
+	require.NotContains(t, text, other.URL)
+	require.NotContains(t, text, pageSrv.URL)
+}
+
 func TestFetchDiagStructureOmitsSecrets(t *testing.T) {
 	t.Setenv("XHS_LOGIN_DIAG", "1")
 	b := newSearchFixtureBrowser(t)
