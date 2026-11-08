@@ -338,3 +338,84 @@ func (h *logCapture) Fire(entry *logrus.Entry) error {
 	h.lines = append(h.lines, entry.Message)
 	return nil
 }
+
+func TestLoginDiagOptional(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+
+	t.Run("默认关闭不写诊断", func(t *testing.T) {
+		t.Setenv("XHS_LOGIN_DIAG", "")
+		page := b.MustPage("about:blank")
+		t.Cleanup(func() { _ = page.Close() })
+		serveExploreFixture(t, page, dialogClosedFixtureHTML, nil)
+		require.NoError(t, page.Timeout(5*time.Second).Navigate(exploreFixtureURL))
+		require.NoError(t, page.Timeout(5*time.Second).WaitLoad())
+		hook := &logCapture{}
+		logrus.AddHook(hook)
+		t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks)) })
+		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+		defer cancel()
+		ok, err := NewLogin(page).WaitForLogin(ctx)
+		require.NoError(t, err)
+		require.False(t, ok)
+		require.NotContains(t, strings.Join(hook.lines, "\n"), "登录诊断：")
+	})
+
+	t.Run("空白弹窗与缺图片分开记录", func(t *testing.T) {
+		t.Setenv("XHS_LOGIN_DIAG", "1")
+		page := b.MustPage("about:blank")
+		t.Cleanup(func() { _ = page.Close() })
+		html := `<!doctype html><html><body><div id="global" data-logged="0">` +
+			`<div class="login-container"><div class="qrcode-box"></div></div>` +
+			`<a id="login-btn" href="/login">登录</a>` +
+			`<a class="link-wrapper" href="/user/profile/fixture-user?xsec_token=secret">作者</a>` +
+			`</div></body></html>`
+		serveExploreFixture(t, page, html, nil)
+		require.NoError(t, page.Timeout(5*time.Second).Navigate(exploreFixtureURL+"?xsec_token=secret#frag"))
+		require.NoError(t, page.Timeout(5*time.Second).WaitLoad())
+		hook := &logCapture{}
+		logrus.AddHook(hook)
+		t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks)) })
+		ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+		defer cancel()
+		ok, err := NewLogin(page).WaitForLogin(ctx)
+		require.NoError(t, err)
+		require.False(t, ok)
+		text := strings.Join(hook.lines, "\n")
+		require.Contains(t, text, "登录诊断：kind=login-entry")
+		require.Contains(t, text, "container=1")
+		require.Contains(t, text, "qrcode_img=0")
+		require.Contains(t, text, "qrcode_src_empty=0")
+		require.Contains(t, text, "login_btn=1")
+		require.Contains(t, text, "account_link=0")
+		require.Contains(t, text, "captcha_modal=0")
+		require.Contains(t, text, "path=/explore")
+		for _, secret := range []string{"fixture-user", "xsec_token", "secret", "?", "#frag"} {
+			require.NotContains(t, text, secret)
+		}
+	})
+
+	t.Run("空 src 的二维码节点仍算弹窗", func(t *testing.T) {
+		t.Setenv("XHS_LOGIN_DIAG", "1")
+		page := b.MustPage("about:blank")
+		t.Cleanup(func() { _ = page.Close() })
+		html := `<!doctype html><html><body><div id="global" data-logged="0">` +
+			`<div class="login-container"><img class="qrcode-img" src=""></div>` +
+			`<a id="login-btn" href="/login">登录</a>` +
+			`</div></body></html>`
+		serveExploreFixture(t, page, html, nil)
+		require.NoError(t, page.Timeout(5*time.Second).Navigate(exploreFixtureURL))
+		require.NoError(t, page.Timeout(5*time.Second).WaitLoad())
+		hook := &logCapture{}
+		logrus.AddHook(hook)
+		t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks)) })
+		ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+		defer cancel()
+		_, err := NewLogin(page).WaitForLogin(ctx)
+		require.NoError(t, err)
+		text := strings.Join(hook.lines, "\n")
+		require.Contains(t, text, "kind=login-dialog")
+		require.Contains(t, text, "qrcode_img=1")
+		require.Contains(t, text, "qrcode_src_empty=1")
+		require.NotContains(t, text, loginQrSrc)
+	})
+}

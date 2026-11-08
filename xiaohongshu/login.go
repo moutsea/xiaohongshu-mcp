@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	goerrors "errors"
+	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -271,7 +273,7 @@ func (a *LoginAction) WaitForLogin(ctx context.Context) (bool, error) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	var lastKind, lastHost string
+	var lastKind, lastHost, lastDiag string
 	noteHost := func() {
 		host := pageHost(pp)
 		if host == "" || host == lastHost {
@@ -304,10 +306,14 @@ func (a *LoginAction) WaitForLogin(ctx context.Context) (bool, error) {
 			switch view.Kind {
 			case loginKindAccount:
 				logrus.Info("登录成功证据：sidebar-profile-link")
+				logLoginDiag(pp, view.Kind, &lastDiag)
 				return true, nil
 			case loginKindBlocked:
 				logrus.Infof("登录等待停止：%v", view.Err)
+				logLoginDiag(pp, view.Kind, &lastDiag)
 				return false, view.Err
+			default:
+				logLoginDiag(pp, view.Kind, &lastDiag)
 			}
 		}
 		select {
@@ -425,18 +431,149 @@ func loginQrExpired(pp *rod.Page) (bool, error) {
 	return strings.Contains(text, "二维码已过期") || strings.Contains(text, "qrcode过期"), nil
 }
 
+func loginDiagOn() bool {
+	return os.Getenv("XHS_LOGIN_DIAG") == "1"
+}
+
+// logLoginDiag 只在 XHS_LOGIN_DIAG=1 时记录公开结构。不记录地址参数、账号或二维码内容。
+func logLoginDiag(pp *rod.Page, kind string, last *string) {
+	if !loginDiagOn() {
+		return
+	}
+	line := formatLoginDiag(kind, readLoginSurface(pp))
+	if line == *last {
+		return
+	}
+	*last = line
+	logrus.Info(line)
+}
+
+type loginSurface struct {
+	host           string
+	path           string
+	container      bool
+	qrcodeImg      bool
+	qrcodeSrcEmpty bool
+	loginBtn       bool
+	accountLink    bool
+	accountHrefOK  bool
+	dataLogged     string
+	expired        bool
+	access         bool
+	downloadQR     bool
+	captchaModal   bool
+}
+
+func readLoginSurface(pp *rod.Page) loginSurface {
+	q := pp.Timeout(2 * time.Second)
+	host, path := safeLocation(frameURL(q))
+	var s loginSurface
+	s.host = host
+	s.path = path
+	s.container = hasSelector(q, ".login-container")
+	s.qrcodeImg, s.qrcodeSrcEmpty = qrcodeImgState(q)
+	s.loginBtn = hasSelector(q, loginEntrySelector)
+	if ok, el, err := q.Has(accountLinkSelector); err == nil && ok && el != nil {
+		s.accountLink = true
+		if href, herr := el.Attribute("href"); herr == nil && href != nil {
+			_, s.accountHrefOK = profileUserID(*href)
+		}
+	}
+	if logged, err := dataLogged(q); err == nil {
+		switch logged {
+		case "", "0", "1":
+			s.dataLogged = logged
+		default:
+			s.dataLogged = "other"
+		}
+	}
+	if expired, err := loginQrExpired(q); err == nil {
+		s.expired = expired
+	}
+	s.access = hasSelector(q, accessLimitSelector)
+	s.downloadQR = hasSelector(q, ".xhs-download-attribution-qr-image")
+	s.captchaModal = hasSelector(q, ".r-captcha-modal")
+	if s.dataLogged == "" {
+		s.dataLogged = "-"
+	}
+	if s.host == "" {
+		s.host = "-"
+	}
+	if s.path == "" {
+		s.path = "-"
+	}
+	return s
+}
+
+func formatLoginDiag(kind string, s loginSurface) string {
+	return fmt.Sprintf(
+		"登录诊断：kind=%s host=%s path=%s container=%d qrcode_img=%d qrcode_src_empty=%d login_btn=%d account_link=%d account_href_ok=%d data_logged=%s expired=%d access=%d download_qr=%d captcha_modal=%d",
+		kind, s.host, s.path,
+		boolBit(s.container), boolBit(s.qrcodeImg), boolBit(s.qrcodeSrcEmpty),
+		boolBit(s.loginBtn), boolBit(s.accountLink), boolBit(s.accountHrefOK),
+		s.dataLogged, boolBit(s.expired), boolBit(s.access), boolBit(s.downloadQR), boolBit(s.captchaModal),
+	)
+}
+
+func boolBit(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func hasSelector(pp *rod.Page, selector string) bool {
+	ok, _, err := pp.Has(selector)
+	return err == nil && ok
+}
+
+func qrcodeImgState(pp *rod.Page) (present, srcEmpty bool) {
+	ok, el, err := pp.Has(loginQrcodeSelector)
+	if err != nil || !ok || el == nil {
+		return false, false
+	}
+	src, err := el.Attribute("src")
+	if err != nil || src == nil || strings.TrimSpace(*src) == "" {
+		return true, true
+	}
+	return true, false
+}
+
+// safeLocation 只留主机和路径。查询串、片段和个人主页 id 都不留下。
+func safeLocation(raw string) (host, path string) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" && u.Path == "" && u.EscapedPath() == "" {
+		return "", ""
+	}
+	host = u.Hostname()
+	if port := u.Port(); port != "" {
+		host = u.Host
+	}
+	path = u.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	const prefix = "/user/profile/"
+	trimmed := strings.TrimSuffix(path, "/")
+	if trimmed == "/user/profile" || strings.HasPrefix(path, prefix) {
+		return host, "/user/profile/{id}"
+	}
+	return host, path
+}
+
+func frameURL(pp *rod.Page) string {
+	frameTree, err := (proto.PageGetFrameTree{}).Call(pp.Timeout(2 * time.Second))
+	if err != nil || frameTree == nil || frameTree.FrameTree == nil || frameTree.FrameTree.Frame == nil {
+		return ""
+	}
+	return frameTree.FrameTree.Frame.URL
+}
+
 func isContextError(err error) bool {
 	return goerrors.Is(err, context.Canceled) || goerrors.Is(err, context.DeadlineExceeded)
 }
 
 func pageHost(pp *rod.Page) string {
-	frameTree, err := (proto.PageGetFrameTree{}).Call(pp.Timeout(2 * time.Second))
-	if err != nil || frameTree == nil || frameTree.FrameTree == nil || frameTree.FrameTree.Frame == nil {
-		return ""
-	}
-	u, err := url.Parse(frameTree.FrameTree.Frame.URL)
-	if err != nil {
-		return ""
-	}
-	return u.Host
+	host, _ := safeLocation(frameURL(pp))
+	return host
 }
