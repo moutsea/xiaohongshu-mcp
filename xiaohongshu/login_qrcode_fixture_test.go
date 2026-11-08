@@ -209,9 +209,81 @@ func TestFetchSiteLoadHint(t *testing.T) {
 	require.Empty(t, img)
 	require.Less(t, time.Since(start), 8*time.Second)
 	text := strings.Join(hook.lines, "\n")
-	require.Contains(t, text, "取码停止：站点加载错误")
+	require.Contains(t, text, "取码停止：站点加载错误 match=visible")
 	require.NotContains(t, text, "点击可见登录入口")
 	require.NotContains(t, text, "登录入口被遮挡")
+}
+
+func TestSiteHintVisibility(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	const phrase = "薯队长遇到了点小麻烦"
+	cases := []struct {
+		name    string
+		html    string
+		visible bool
+		kind    string
+	}{
+		{"script", `<script>var s="` + phrase + `"</script>`, false, ""},
+		{"template", `<template><div>` + phrase + `</div></template>`, false, ""},
+		{"display-none", `<div style="display:none">` + phrase + `</div>`, false, "hidden"},
+		{"visibility-hidden", `<div style="visibility:hidden">` + phrase + `</div>`, false, "hidden"},
+		{"offscreen", `<div style="position:absolute;left:-9999px;top:0">` + phrase + `</div>`, false, "offscreen"},
+		{"opacity0", `<div style="opacity:0">` + phrase + `</div>`, false, "transparent"},
+		{"clip", `<div style="height:0;overflow:hidden">` + phrase + `</div>`, false, "clipped"},
+		{"visible", `<div>` + phrase + `</div>`, true, "visible"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, page.SetDocumentContent(`<!doctype html><html><body>`+tc.html+`</body></html>`))
+			visible, kind, err := siteQRHint(page)
+			require.NoError(t, err)
+			require.Equal(t, tc.visible, visible)
+			require.Equal(t, tc.kind, kind)
+		})
+	}
+}
+
+func TestFetchOffscreenHintWaitsForQR(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	html := `<!doctype html><html><body>` +
+		`<div style="position:absolute;left:-9999px;top:0">薯队长遇到了点小麻烦</div>` +
+		`<div class="login-container"><img class="qrcode-img" src=""></div>` +
+		`<script>setTimeout(() => {` +
+		`document.querySelector(".qrcode-img").setAttribute("src", "` + loginQrSrc + `");` +
+		`}, 4000);</script></body></html>`
+	serveExploreFixture(t, page, html, nil)
+	hook := &logCapture{}
+	logrus.AddHook(hook)
+	t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks)) })
+	start := time.Now()
+	img, loggedIn, err := NewLogin(page).FetchQrcodeImage(context.Background())
+	require.NoError(t, err)
+	require.False(t, loggedIn)
+	require.Equal(t, loginQrSrc, img)
+	require.Greater(t, time.Since(start), 3*time.Second)
+	require.Less(t, time.Since(start), 12*time.Second)
+	text := strings.Join(hook.lines, "\n")
+	require.Contains(t, text, "取码提示：忽略非可见匹配 kind=offscreen")
+	require.NotContains(t, text, "站点加载错误")
+}
+
+func TestFetchReadyQRIgnoresVisibleHint(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	html := `<!doctype html><html><body>` +
+		`<div>薯队长遇到了点小麻烦</div>` +
+		`<div class="login-container"><img class="qrcode-img" src="` + loginQrSrc + `"></div>` +
+		`</body></html>`
+	serveExploreFixture(t, page, html, nil)
+	img, loggedIn, err := NewLogin(page).FetchQrcodeImage(context.Background())
+	require.NoError(t, err)
+	require.False(t, loggedIn)
+	require.Equal(t, loginQrSrc, img)
 }
 
 func TestFetchHiddenButton(t *testing.T) {

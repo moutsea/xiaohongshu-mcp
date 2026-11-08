@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -202,9 +203,10 @@ func observeLoginQrcode(pp *rod.Page) (string, error) {
 	sawButton := false
 	miss := entryMissNone
 	announcedModal := false
+	hintKind := ""
 	var diag string
 	for {
-		src, done, err := pollLoginQrcode(pp, &clicked, &sawButton, &miss, &announcedModal, &diag)
+		src, done, err := pollLoginQrcode(pp, &clicked, &sawButton, &miss, &announcedModal, &hintKind, &diag)
 		if done || err != nil {
 			return src, err
 		}
@@ -218,26 +220,31 @@ func observeLoginQrcode(pp *rod.Page) (string, error) {
 	return "", loginObserveTimeout(pp, clicked, sawButton, miss)
 }
 
-func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, announcedModal *bool, diag *string) (string, bool, error) {
+func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, announcedModal *bool, hintKind, diag *string) (string, bool, error) {
 	if err := pp.GetContext().Err(); err != nil {
 		return "", true, errors.Wrap(err, "等待登录二维码时被取消")
 	}
 	if err := pageBlocked(pp); err != nil {
 		return "", true, err
 	}
-	failed, err := siteQRLoadFailed(pp)
-	if err != nil {
-		return "", true, err
-	}
-	if failed {
-		logrus.Info("取码停止：站点加载错误")
-		return "", true, errSiteQRLoad
-	}
+	// 已经有二维码就返回，不用提示文案盖掉它。
 	if src, found, err := existingLoginQrcode(pp); err != nil || found {
 		if err == nil && found {
 			logrus.Info("取码观察：已有二维码")
 		}
 		return src, true, err
+	}
+	visible, kind, err := siteQRHint(pp)
+	if err != nil {
+		return "", true, err
+	}
+	if visible {
+		logrus.Info("取码停止：站点加载错误 match=visible")
+		return "", true, errSiteQRLoad
+	}
+	if kind != "" && kind != *hintKind {
+		logrus.Infof("取码提示：忽略非可见匹配 kind=%s", kind)
+		*hintKind = kind
 	}
 	modal := hasSelector(pp, ".login-container")
 	if loginDiagOn() {
@@ -276,12 +283,12 @@ func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, an
 }
 
 func loginObserveTimeout(pp *rod.Page, clicked, sawButton bool, miss entryMiss) error {
-	failed, err := siteQRLoadFailed(pp)
+	visible, _, err := siteQRHint(pp)
 	if err != nil {
 		return err
 	}
-	if failed {
-		logrus.Info("取码停止：站点加载错误")
+	if visible {
+		logrus.Info("取码停止：站点加载错误 match=visible")
 		return errSiteQRLoad
 	}
 	if clicked || hasSelector(pp, ".login-container") {
@@ -296,19 +303,138 @@ func loginObserveTimeout(pp *rod.Page, clicked, sawButton bool, miss entryMiss) 
 	return errors.New("登录入口不可点击")
 }
 
-func siteQRLoadFailed(pp *rod.Page) (bool, error) {
-	el, err := pp.Sleeper(rod.NotFoundSleeper).Element("body")
+// siteQRHint 查找公开提示。只有视口内、有尺寸、不透明的节点才算可见。
+// 脚本、屏外、透明和零高度节点不算，避免用残留文案打断二维码等待。
+func siteQRHint(pp *rod.Page) (bool, string, error) {
+	if err := pp.GetContext().Err(); err != nil {
+		return false, "", errors.Wrap(err, "等待登录二维码时被取消")
+	}
+	_ = proto.DOMEnable{}.Call(pp)
+	_, _ = proto.DOMGetDocument{}.Call(pp)
+	res, err := proto.DOMPerformSearch{Query: siteQRLoadHint}.Call(pp)
 	if err != nil {
-		if goerrors.Is(err, &rod.ElementNotFoundError{}) {
-			return false, nil
+		if pp.GetContext().Err() != nil {
+			return false, "", errors.Wrap(pp.GetContext().Err(), "等待登录二维码时被取消")
 		}
-		return false, errors.Wrap(err, "读取页面提示失败")
+		return false, "", nil
 	}
-	text, err := el.Text()
-	if err != nil {
-		return false, errors.Wrap(err, "读取页面提示失败")
+	defer func() { _ = proto.DOMDiscardSearchResults{SearchID: res.SearchID}.Call(pp) }()
+	if res.ResultCount == 0 {
+		return false, "", nil
 	}
-	return strings.Contains(text, siteQRLoadHint), nil
+	n := res.ResultCount
+	if n > 5 {
+		n = 5
+	}
+	nodes, err := proto.DOMGetSearchResults{SearchID: res.SearchID, FromIndex: 0, ToIndex: n}.Call(pp)
+	if err != nil || nodes == nil {
+		return false, "", nil
+	}
+	ignored := ""
+	for _, id := range nodes.NodeIDs {
+		if id == 0 {
+			continue
+		}
+		el, err := pp.ElementFromNode(&proto.DOMNode{NodeID: id})
+		if err != nil {
+			continue
+		}
+		if hintSkippedNode(el) {
+			continue
+		}
+		kind := hintVisibility(el)
+		if kind == "visible" {
+			return true, "visible", nil
+		}
+		if ignored == "" {
+			ignored = kind
+		}
+	}
+	return false, ignored, nil
+}
+
+func hintSkippedNode(el *rod.Element) bool {
+	node, err := el.Describe(0, false)
+	if err != nil || node == nil {
+		return false
+	}
+	switch node.NodeName {
+	case "SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE":
+		return true
+	default:
+		return false
+	}
+}
+
+func hintVisibility(el *rod.Element) string {
+	cur := el
+	for i := 0; i < 8 && cur != nil; i++ {
+		vis, err := cur.Visible()
+		if err != nil || !vis {
+			return "hidden"
+		}
+		if op, ok := elementOpacity(cur); ok && op == 0 {
+			return "transparent"
+		}
+		node, err := cur.Describe(0, false)
+		if err != nil || node == nil || node.NodeName == "BODY" || node.NodeName == "HTML" {
+			break
+		}
+		parent, err := cur.Parent()
+		if err != nil {
+			break
+		}
+		cur = parent
+	}
+	shape, err := el.Shape()
+	if err != nil || shape == nil || shape.Box() == nil {
+		return "clipped"
+	}
+	box := shape.Box()
+	if box.Width < 1 || box.Height < 1 {
+		return "clipped"
+	}
+	if !boxInViewport(el, box) {
+		return "offscreen"
+	}
+	return "visible"
+}
+
+func elementOpacity(el *rod.Element) (float64, bool) {
+	node, err := el.Describe(0, false)
+	if err != nil || node == nil || node.NodeID == 0 {
+		return 1, false
+	}
+	_ = proto.CSSEnable{}.Call(el)
+	styles, err := proto.CSSGetComputedStyleForNode{NodeID: node.NodeID}.Call(el)
+	if err != nil || styles == nil {
+		return 1, false
+	}
+	for _, item := range styles.ComputedStyle {
+		if item.Name != "opacity" {
+			continue
+		}
+		value, err := strconv.ParseFloat(item.Value, 64)
+		if err != nil {
+			return 1, false
+		}
+		return value, true
+	}
+	return 1, false
+}
+
+func boxInViewport(el *rod.Element, box *proto.DOMRect) bool {
+	vw, vh := 800.0, 600.0
+	metrics, err := proto.PageGetLayoutMetrics{}.Call(el)
+	if err == nil && metrics != nil && metrics.CSSVisualViewport != nil {
+		if metrics.CSSVisualViewport.ClientWidth > 0 {
+			vw = metrics.CSSVisualViewport.ClientWidth
+		}
+		if metrics.CSSVisualViewport.ClientHeight > 0 {
+			vh = metrics.CSSVisualViewport.ClientHeight
+		}
+	}
+	return box.X < vw && box.Y < vh && box.X+box.Width > 0 && box.Y+box.Height > 0
 }
 
 func clickInteractableEntry(pp *rod.Page) (bool, entryMiss, error) {
