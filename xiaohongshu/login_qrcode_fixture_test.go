@@ -18,6 +18,10 @@ import (
 
 const exploreFixtureURL = "https://www.xiaohongshu.com/explore"
 
+func isLoginFixtureURL(raw string) bool {
+	return strings.HasPrefix(raw, exploreFixtureURL) || strings.HasPrefix(raw, "https://www.xiaohongshu.com/search_result")
+}
+
 const qrcodeFixtureHTML = `<!doctype html><html><body>` +
 	`<div class="login-container"><img class="qrcode-img" src="data:image/png;base64,aaaa"></div>` +
 	`</body></html>`
@@ -96,7 +100,7 @@ func serveExploreFixture(t *testing.T, page *rod.Page, document string, beforeRe
 	router.MustAdd("*", func(h *rod.Hijack) {
 		h.OnError = func(error) {}
 		h.Response.SetHeader("Content-Type", "text/html; charset=utf-8")
-		if h.Request.IsNavigation() && strings.HasPrefix(h.Request.URL().String(), exploreFixtureURL) {
+		if h.Request.IsNavigation() && isLoginFixtureURL(h.Request.URL().String()) {
 			if beforeRespond != nil {
 				beforeRespond()
 			}
@@ -107,6 +111,33 @@ func serveExploreFixture(t *testing.T, page *rod.Page, document string, beforeRe
 	})
 	go router.Run()
 	t.Cleanup(func() { _ = router.Stop() })
+}
+
+func TestFetchUsesSearchResult(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	var search, explore int
+	serveNavigation(t, page, func(h *rod.Hijack) {
+		h.Response.SetHeader("Content-Type", "text/html; charset=utf-8")
+		raw := h.Request.URL().String()
+		switch {
+		case strings.HasPrefix(raw, "https://www.xiaohongshu.com/search_result"):
+			search++
+			h.Response.SetBody(qrcodeFixtureHTML)
+		case strings.HasPrefix(raw, exploreFixtureURL):
+			explore++
+			h.Response.SetBody(emptyFixtureHTML)
+		default:
+			h.Response.SetBody(emptyFixtureHTML)
+		}
+	})
+	img, loggedIn, err := NewLogin(page).FetchQrcodeImage(context.Background())
+	require.NoError(t, err)
+	require.False(t, loggedIn)
+	require.Equal(t, "data:image/png;base64,aaaa", img)
+	require.Greater(t, search, 0)
+	require.Zero(t, explore)
 }
 
 func TestFetchQrcodeImageLocal(t *testing.T) {
@@ -298,12 +329,12 @@ func TestFetchQrcodeImageLocal(t *testing.T) {
 		require.Less(t, time.Since(start), 15*time.Second)
 	})
 
-	t.Run("探索页跳转后仍走登录入口", func(t *testing.T) {
+	t.Run("登录页跳转后仍走登录入口", func(t *testing.T) {
 		page := b.MustPage("about:blank")
 		t.Cleanup(func() { _ = page.Close() })
 		serveNavigation(t, page, func(h *rod.Hijack) {
 			switch {
-			case strings.HasPrefix(h.Request.URL().String(), exploreFixtureURL):
+			case isLoginFixtureURL(h.Request.URL().String()):
 				h.Response.Payload().ResponseCode = http.StatusFound
 				h.Response.SetHeader("Location", rednoteFixtureURL)
 				h.Response.SetBody("")
@@ -336,7 +367,7 @@ func TestFetchQrcodeImageLocal(t *testing.T) {
 		t.Cleanup(func() { _ = page.Close() })
 		serveNavigation(t, page, func(h *rod.Hijack) {
 			switch {
-			case strings.HasPrefix(h.Request.URL().String(), exploreFixtureURL):
+			case isLoginFixtureURL(h.Request.URL().String()):
 				h.Response.Payload().ResponseCode = http.StatusFound
 				h.Response.SetHeader("Location", captchaFixtureURL)
 				h.Response.SetBody("")

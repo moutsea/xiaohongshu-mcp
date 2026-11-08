@@ -18,6 +18,9 @@ import (
 
 const (
 	exploreURL = "https://www.xiaohongshu.com/explore"
+	// 未登录时 /explore 会被站点 302 到 www.rednote.com。
+	// 公开搜索页留在 www.xiaohongshu.com，游客也会出现登录框。
+	loginPageURL = "https://www.xiaohongshu.com/search_result?keyword=%E5%B0%8F%E7%BA%A2%E4%B9%A6&source=web_explore_feed"
 	// 导航和 load 共用这一段，避免两段各算一次。
 	exploreNavTimeout = 15 * time.Second
 	exploreSettle     = 2 * time.Second
@@ -192,9 +195,10 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 }
 
 func navigateExplore(pp *rod.Page, reason string) error {
-	logrus.Infof("程序导航：%s url=%s", reason, exploreURL)
+	host, path := safeLocation(loginPageURL)
+	logrus.Infof("程序导航：%s host=%s path=%s", reason, host, path)
 	nav := pp.Timeout(exploreNavTimeout)
-	if err := nav.Navigate(exploreURL); err != nil {
+	if err := nav.Navigate(loginPageURL); err != nil {
 		return errors.Wrap(err, "open explore failed")
 	}
 	if err := nav.WaitLoad(); err != nil {

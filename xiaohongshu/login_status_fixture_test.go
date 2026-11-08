@@ -100,7 +100,7 @@ func TestCheckLoginStatusFixtures(t *testing.T) {
 		t.Cleanup(func() { _ = page.Close() })
 		serveNavigation(t, page, func(h *rod.Hijack) {
 			switch {
-			case strings.HasPrefix(h.Request.URL().String(), exploreFixtureURL):
+			case isLoginFixtureURL(h.Request.URL().String()):
 				h.Response.Payload().ResponseCode = 302
 				h.Response.SetHeader("Location", captchaFixtureURL)
 				h.Response.SetBody("")
