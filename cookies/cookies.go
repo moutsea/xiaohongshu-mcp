@@ -106,13 +106,41 @@ func (c *localCookie) write(cks []byte, seed int) error {
 		return errors.Wrap(err, "marshal session file failed")
 	}
 
-	if dir := filepath.Dir(c.path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return errors.Wrap(err, "create cookies dir failed")
-		}
+	dir := filepath.Dir(c.path)
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return errors.Wrap(err, "create cookies dir failed")
 	}
 
-	return os.WriteFile(c.path, data, 0644)
+	tmp, err := os.CreateTemp(dir, ".cookies-*.tmp")
+	if err != nil {
+		return errors.Wrap(err, "create cookies temp file failed")
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return errors.Wrap(err, "write cookies temp file failed")
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return errors.Wrap(err, "chmod cookies temp file failed")
+	}
+	if err := tmp.Close(); err != nil {
+		return errors.Wrap(err, "close cookies temp file failed")
+	}
+	if err := os.Rename(tmpName, c.path); err != nil {
+		return errors.Wrap(err, "rename cookies file failed")
+	}
+	ok = true
+	return nil
 }
 
 // DeleteCookies 删除 cookies 文件。

@@ -23,8 +23,10 @@ const qrcodeFixtureHTML = `<!doctype html><html><body>` +
 	`</body></html>`
 
 const loggedInFixtureHTML = `<!doctype html><html><body>` +
-	`<div class="main-container"><div class="user"><a class="link-wrapper"><span class="channel">me</span></a></div></div>` +
-	`</body></html>`
+	`<div id="global" data-logged="1"><div id="app"></div><div class="main-container">` +
+	`<li class="user side-bar-component"><div class="link-wrapper">` +
+	`<a class="link-wrapper" href="/user/profile/fixture-user"><span class="channel">我</span></a>` +
+	`</div></li></div></div></body></html>`
 
 const missingQrcodeFixtureHTML = `<!doctype html><html><body><div class="main-container">no qrcode</div></body></html>`
 

@@ -3,11 +3,15 @@ package xiaohongshu
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -32,7 +36,32 @@ const loginEntrySelector = "#login-btn"
 // 访问限制组件。里面的二维码是限制提示，不是登录码。
 const accessLimitSelector = ".access-wrapper, .access-container"
 
+// 已登录侧栏入口。公开页面只在 loggedIn 时渲染，href 指向 /user/profile/<id>。
+const accountLinkSelector = "div.main-container li.user.side-bar-component a.link-wrapper"
+
+// 登录框关掉后，隔这一小段再打开首页核对一次。框还在时不刷新，避免打断扫码。
+const loginRecheckAfter = 3 * time.Second
+
+const (
+	loginKindAccount  = "sidebar-profile-link"
+	loginKindGuest    = "guest"
+	loginKindEntry    = "login-entry"
+	loginKindDialog   = "login-dialog"
+	loginKindDownload = "download-qr"
+	loginKindExpired  = "qr-expired"
+	loginKindBlocked  = "blocked"
+	loginKindLoading  = "loading"
+)
+
 var errPageAccessLimited = errors.New("页面出现访问限制，已停止")
+var errNotLoggedIn = errors.New("未登录，无法打开个人主页")
+
+// loginObservation 是当前公开页面的登录判断，不是 cookie 或内部接口的结果。
+type loginObservation struct {
+	Kind string
+	Err  error
+	Link *rod.Element
+}
 
 type LoginAction struct {
 	page *rod.Page
@@ -43,22 +72,23 @@ func NewLogin(page *rod.Page) *LoginAction {
 }
 
 func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
-	// 加超时保护：只是查登录态的快速检查，不应无限挂（登录扫码的等待在 Login/WaitForLogin 里）
-	pp := a.page.Context(ctx).Timeout(30 * time.Second)
-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
-
-	time.Sleep(1 * time.Second)
-
-	exists, _, err := pp.Has(`.main-container .user .link-wrapper .channel`)
+	pp := a.page.Context(ctx)
+	if err := navigateExplore(pp); err != nil {
+		return false, err
+	}
+	if err := settle(pp.GetContext()); err != nil {
+		return false, err
+	}
+	view, err := observeLogin(pp)
 	if err != nil {
-		return false, errors.Wrap(err, "check login status failed")
+		return false, err
 	}
-
-	if !exists {
-		return false, errors.Wrap(err, "login status element not found")
+	if view.Kind == loginKindBlocked {
+		return false, view.Err
 	}
-
-	return true, nil
+	loggedIn := view.Kind == loginKindAccount
+	logrus.Infof("检查登录状态：%s", view.Kind)
+	return loggedIn, nil
 }
 
 // CurrentUser 当前登录用户的基础信息。
@@ -130,9 +160,14 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 		return "", false, err
 	}
 
-	if exists, _, err := pp.Has(".main-container .user .link-wrapper .channel"); err != nil {
-		return "", false, errors.Wrap(err, "check login status failed")
-	} else if exists {
+	view, err := observeLogin(pp)
+	if err != nil {
+		return "", false, err
+	}
+	if view.Kind == loginKindBlocked {
+		return "", false, view.Err
+	}
+	if view.Kind == loginKindAccount {
 		return "", true, nil
 	}
 
@@ -230,20 +265,193 @@ func qrcodeSrc(el *rod.Element) (string, error) {
 	return *src, nil
 }
 
-func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
+// WaitForLogin 在当前页轮询账号入口。ctx 由调用方单独计时，不用取码的短超时。
+// 只有侧栏个人主页链接算成功。登录框消失、下载码、过期二维码都不会成功。
+func (a *LoginAction) WaitForLogin(ctx context.Context) (bool, error) {
+	logrus.Info("等待扫码确认：开始轮询账号入口")
 	pp := a.page.Context(ctx)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
+	var lastKind, lastHost string
+	var sawLoginUI bool
+	var dialogGoneAt time.Time
+	var rechecked bool
+
 	for {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-ticker.C:
-			el, err := pp.Element(".main-container .user .link-wrapper .channel")
-			if err == nil && el != nil {
-				return true
+		if ctx.Err() != nil {
+			logrus.Infof("等待扫码确认结束：%s，最后状态=%s", ctx.Err(), lastKind)
+			return false, nil
+		}
+		if host := pageHost(pp); host != "" && host != lastHost {
+			if lastHost != "" {
+				logrus.Infof("页面主机变化：%s -> %s", lastHost, host)
+			}
+			lastHost = host
+		}
+		view, err := observeLogin(pp)
+		if err != nil {
+			if ctx.Err() != nil {
+				logrus.Infof("等待扫码确认结束：%s，最后状态=%s", ctx.Err(), lastKind)
+				return false, nil
+			}
+			logrus.Errorf("读取登录状态失败：%v", err)
+		} else {
+			if view.Kind != lastKind {
+				logrus.Infof("登录状态：%s", view.Kind)
+				lastKind = view.Kind
+			}
+			switch view.Kind {
+			case loginKindAccount:
+				logrus.Info("登录成功证据：sidebar-profile-link")
+				return true, nil
+			case loginKindBlocked:
+				logrus.Infof("登录等待停止：%v", view.Err)
+				return false, view.Err
+			case loginKindDialog, loginKindExpired:
+				sawLoginUI = true
+				dialogGoneAt = time.Time{}
+			default:
+				if sawLoginUI && !rechecked {
+					if dialogGoneAt.IsZero() {
+						dialogGoneAt = time.Now()
+					} else if time.Since(dialogGoneAt) >= loginRecheckAfter {
+						rechecked = true
+						logrus.Info("登录框已关闭且未见账号入口，重新打开首页核对")
+						if err := navigateExplore(pp); err != nil {
+							logrus.Infof("重新打开首页失败：%v", err)
+						}
+					}
+				}
 			}
 		}
+		select {
+		case <-ctx.Done():
+			logrus.Infof("等待扫码确认结束：%s，最后状态=%s", ctx.Err(), lastKind)
+			return false, nil
+		case <-ticker.C:
+		}
 	}
+}
+
+func observeLogin(pp *rod.Page) (loginObservation, error) {
+	if err := pageBlocked(pp); err != nil {
+		if isContextError(err) {
+			return loginObservation{}, err
+		}
+		return loginObservation{Kind: loginKindBlocked, Err: err}, nil
+	}
+	logged, err := dataLogged(pp)
+	if err != nil {
+		return loginObservation{}, err
+	}
+	link, ok, err := accountLink(pp)
+	if err != nil {
+		return loginObservation{}, err
+	}
+	if ok && logged != "0" {
+		return loginObservation{Kind: loginKindAccount, Link: link}, nil
+	}
+	if ok && logged == "0" {
+		return loginObservation{Kind: loginKindGuest}, nil
+	}
+	expired, err := loginQrExpired(pp)
+	if err != nil {
+		return loginObservation{}, err
+	}
+	if expired {
+		return loginObservation{Kind: loginKindExpired}, nil
+	}
+	if exists, _, err := pp.Has(loginQrcodeSelector); err != nil {
+		return loginObservation{}, err
+	} else if exists {
+		return loginObservation{Kind: loginKindDialog}, nil
+	}
+	if exists, _, err := pp.Has(loginEntrySelector); err != nil {
+		return loginObservation{}, err
+	} else if exists {
+		return loginObservation{Kind: loginKindEntry}, nil
+	}
+	if exists, _, err := pp.Has(".xhs-download-attribution-qr-image"); err != nil {
+		return loginObservation{}, err
+	} else if exists {
+		return loginObservation{Kind: loginKindDownload}, nil
+	}
+	return loginObservation{Kind: loginKindLoading}, nil
+}
+
+func accountLink(pp *rod.Page) (*rod.Element, bool, error) {
+	ok, el, err := pp.Has(accountLinkSelector)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	href, err := el.Attribute("href")
+	if err != nil || href == nil {
+		return nil, false, err
+	}
+	if _, ok := profileUserID(*href); !ok {
+		return nil, false, nil
+	}
+	return el, true, nil
+}
+
+// profileUserID 只接受 /user/profile/<id>。空 id 和 guest 不算已登录账号。
+func profileUserID(href string) (string, bool) {
+	u, err := url.Parse(href)
+	if err != nil {
+		return "", false
+	}
+	const prefix = "/user/profile/"
+	path := strings.TrimSuffix(u.EscapedPath(), "/")
+	if !strings.HasPrefix(path, prefix) {
+		return "", false
+	}
+	id := strings.TrimPrefix(path, prefix)
+	if i := strings.IndexByte(id, '/'); i >= 0 {
+		id = id[:i]
+	}
+	if id == "" || strings.EqualFold(id, "guest") {
+		return "", false
+	}
+	return id, true
+}
+
+func dataLogged(pp *rod.Page) (string, error) {
+	ok, el, err := pp.Has("#global")
+	if err != nil || !ok {
+		return "", err
+	}
+	value, err := el.Attribute("data-logged")
+	if err != nil || value == nil {
+		return "", err
+	}
+	return *value, nil
+}
+
+func loginQrExpired(pp *rod.Page) (bool, error) {
+	ok, el, err := pp.Has(".login-container")
+	if err != nil || !ok {
+		return false, err
+	}
+	text, err := el.Text()
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(text, "二维码已过期") || strings.Contains(text, "qrcode过期"), nil
+}
+
+func isContextError(err error) bool {
+	return goerrors.Is(err, context.Canceled) || goerrors.Is(err, context.DeadlineExceeded)
+}
+
+func pageHost(pp *rod.Page) string {
+	frameTree, err := (proto.PageGetFrameTree{}).Call(pp.Timeout(2 * time.Second))
+	if err != nil || frameTree == nil || frameTree.FrameTree == nil || frameTree.FrameTree.Frame == nil {
+		return ""
+	}
+	u, err := url.Parse(frameTree.FrameTree.Frame.URL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
