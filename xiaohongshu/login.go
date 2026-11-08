@@ -200,6 +200,8 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 // observeLoginQrcode 在同一段时限内看登录框、二维码和可见入口。
 // 登录框出现后不再点击。只点击一次真正可交互的入口。不刷新、不重新导航。
 func observeLoginQrcode(pp *rod.Page) (string, error) {
+	stopNet := startLoginNetDiag(pp)
+	defer stopNet()
 	deadline := time.Now().Add(qrcodeWaitTimeout)
 	clicked := false
 	sawButton := false
@@ -258,6 +260,7 @@ func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, an
 	if modal {
 		if !*announcedModal {
 			logrus.Info("取码观察：登录框已在，等待二维码节点")
+			logLoginBoxStructure(pp, "open")
 			*announcedModal = true
 		}
 		return "", false, nil
@@ -291,6 +294,7 @@ func loginObserveTimeout(pp *rod.Page, clicked, sawButton bool, miss entryMiss, 
 		return errSiteQRLoad
 	}
 	if clicked || hasSelector(pp, ".login-container") {
+		logLoginBoxStructure(pp, "timeout")
 		return errors.New("登录框未出现登录二维码")
 	}
 	if !sawButton {
