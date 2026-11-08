@@ -30,6 +30,8 @@ const (
 	// 登录框、二维码、可见入口共用这一段，只观察一轮，不叠加、不重试。
 	qrcodeWaitTimeout = 15 * time.Second
 	loginObserveTick  = 200 * time.Millisecond
+	// 提示日志只在类别变化时写，并且有上限。
+	hintLogLimit = 8
 	// 导航加上这一轮观察仍低于宿主 60 秒。
 	fetchQrcodeBudget = 50 * time.Second
 	// 公开弹窗上的站点提示。出现时二维码区域是空的，不是按钮被挡住。
@@ -203,10 +205,10 @@ func observeLoginQrcode(pp *rod.Page) (string, error) {
 	sawButton := false
 	miss := entryMissNone
 	announcedModal := false
-	hintKind := ""
+	var hints hintLogState
 	var diag string
 	for {
-		src, done, err := pollLoginQrcode(pp, &clicked, &sawButton, &miss, &announcedModal, &hintKind, &diag)
+		src, done, err := pollLoginQrcode(pp, &clicked, &sawButton, &miss, &announcedModal, &hints, &diag)
 		if done || err != nil {
 			return src, err
 		}
@@ -217,10 +219,10 @@ func observeLoginQrcode(pp *rod.Page) (string, error) {
 			return "", err
 		}
 	}
-	return "", loginObserveTimeout(pp, clicked, sawButton, miss)
+	return "", loginObserveTimeout(pp, clicked, sawButton, miss, &hints)
 }
 
-func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, announcedModal *bool, hintKind, diag *string) (string, bool, error) {
+func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, announcedModal *bool, hints *hintLogState, diag *string) (string, bool, error) {
 	if err := pp.GetContext().Err(); err != nil {
 		return "", true, errors.Wrap(err, "等待登录二维码时被取消")
 	}
@@ -234,18 +236,15 @@ func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, an
 		}
 		return src, true, err
 	}
-	visible, kind, err := siteQRHint(pp)
+	hit, err := siteQRHint(pp)
 	if err != nil {
 		return "", true, err
 	}
-	if visible {
-		logrus.Info("取码停止：站点加载错误 match=visible")
+	if hit.visible {
+		hints.note(hit, true)
 		return "", true, errSiteQRLoad
 	}
-	if kind != "" && kind != *hintKind {
-		logrus.Infof("取码提示：忽略非可见匹配 kind=%s", kind)
-		*hintKind = kind
-	}
+	hints.note(hit, false)
 	modal := hasSelector(pp, ".login-container")
 	if loginDiagOn() {
 		kind := loginKindLoading
@@ -266,11 +265,11 @@ func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, an
 	if *clicked {
 		return "", false, nil
 	}
-	hit, buttonMiss, err := clickInteractableEntry(pp)
+	clickedHit, buttonMiss, err := clickInteractableEntry(pp)
 	if err != nil {
 		return "", true, err
 	}
-	if hit {
+	if clickedHit {
 		*clicked = true
 		logrus.Info("取码观察：点击可见登录入口")
 		return "", false, nil
@@ -282,13 +281,13 @@ func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, an
 	return "", false, nil
 }
 
-func loginObserveTimeout(pp *rod.Page, clicked, sawButton bool, miss entryMiss) error {
-	visible, _, err := siteQRHint(pp)
+func loginObserveTimeout(pp *rod.Page, clicked, sawButton bool, miss entryMiss, hints *hintLogState) error {
+	hit, err := siteQRHint(pp)
 	if err != nil {
 		return err
 	}
-	if visible {
-		logrus.Info("取码停止：站点加载错误 match=visible")
+	if hit.visible {
+		hints.note(hit, true)
 		return errSiteQRLoad
 	}
 	if clicked || hasSelector(pp, ".login-container") {
@@ -303,24 +302,58 @@ func loginObserveTimeout(pp *rod.Page, clicked, sawButton bool, miss entryMiss) 
 	return errors.New("登录入口不可点击")
 }
 
-// siteQRHint 查找公开提示。只有视口内、有尺寸、不透明的节点才算可见。
-// 脚本、屏外、透明和零高度节点不算，避免用残留文案打断二维码等待。
-func siteQRHint(pp *rod.Page) (bool, string, error) {
+// hintHit 是一次提示匹配。不保存页面原文，whitelist 只表示是否等于已知那一句。
+type hintHit struct {
+	visible   bool
+	kind      string
+	node      string
+	whitelist int
+	box       string
+}
+
+type hintLogState struct {
+	last string
+	n    int
+}
+
+func (s *hintLogState) note(hit hintHit, stop bool) {
+	if s == nil || hit.kind == "" || s.n >= hintLogLimit {
+		return
+	}
+	key := hit.node + "|" + strconv.Itoa(hit.whitelist) + "|" + hit.kind
+	if key == s.last {
+		return
+	}
+	s.last = key
+	s.n++
+	box := hit.box
+	if box == "" {
+		box = "-"
+	}
+	if stop {
+		logrus.Infof("取码停止：站点加载错误 node=%s whitelist=%d box=%s kind=%s", hit.node, hit.whitelist, box, hit.kind)
+		return
+	}
+	logrus.Infof("取码提示：node=%s whitelist=%d box=%s kind=%s", hit.node, hit.whitelist, box, hit.kind)
+}
+
+// siteQRHint 只接受白名单那句的真实文字。属性、屏外、透明、裁剪和遮挡都不算。
+func siteQRHint(pp *rod.Page) (hintHit, error) {
 	if err := pp.GetContext().Err(); err != nil {
-		return false, "", errors.Wrap(err, "等待登录二维码时被取消")
+		return hintHit{}, errors.Wrap(err, "等待登录二维码时被取消")
 	}
 	_ = proto.DOMEnable{}.Call(pp)
 	_, _ = proto.DOMGetDocument{}.Call(pp)
 	res, err := proto.DOMPerformSearch{Query: siteQRLoadHint}.Call(pp)
 	if err != nil {
 		if pp.GetContext().Err() != nil {
-			return false, "", errors.Wrap(pp.GetContext().Err(), "等待登录二维码时被取消")
+			return hintHit{}, errors.Wrap(pp.GetContext().Err(), "等待登录二维码时被取消")
 		}
-		return false, "", nil
+		return hintHit{}, nil
 	}
 	defer func() { _ = proto.DOMDiscardSearchResults{SearchID: res.SearchID}.Call(pp) }()
 	if res.ResultCount == 0 {
-		return false, "", nil
+		return hintHit{}, nil
 	}
 	n := res.ResultCount
 	if n > 5 {
@@ -328,32 +361,79 @@ func siteQRHint(pp *rod.Page) (bool, string, error) {
 	}
 	nodes, err := proto.DOMGetSearchResults{SearchID: res.SearchID, FromIndex: 0, ToIndex: n}.Call(pp)
 	if err != nil || nodes == nil {
-		return false, "", nil
+		return hintHit{}, nil
 	}
-	ignored := ""
+	var ignored hintHit
 	for _, id := range nodes.NodeIDs {
 		if id == 0 {
 			continue
 		}
-		el, err := pp.ElementFromNode(&proto.DOMNode{NodeID: id})
-		if err != nil {
+		hit := classifyHintNode(pp, id)
+		if hit.visible {
+			return hit, nil
+		}
+		if hit.kind == "" {
 			continue
 		}
-		if hintSkippedNode(el) {
-			continue
-		}
-		kind := hintVisibility(el)
-		if kind == "visible" {
-			return true, "visible", nil
-		}
-		if ignored == "" {
-			ignored = kind
+		if ignored.kind == "" || (ignored.node != "text" && hit.node == "text") {
+			ignored = hit
 		}
 	}
-	return false, ignored, nil
+	return ignored, nil
+}
+
+func classifyHintNode(pp *rod.Page, id proto.DOMNodeID) hintHit {
+	described, err := proto.DOMDescribeNode{NodeID: id}.Call(pp)
+	if err != nil || described == nil || described.Node == nil {
+		return hintHit{}
+	}
+	raw := described.Node
+	if raw.NodeType != 3 {
+		return hintHit{node: "element", kind: "attribute", box: elementBox(pp, id)}
+	}
+	parent, err := pp.ElementFromNode(&proto.DOMNode{NodeID: id})
+	if err != nil || hintSkippedNode(parent) {
+		return hintHit{}
+	}
+	hit := hintHit{node: "text"}
+	if strings.TrimSpace(raw.NodeValue) == siteQRLoadHint {
+		hit.whitelist = 1
+	}
+	if hit.whitelist != 1 {
+		hit.kind = "other"
+		return hit
+	}
+	if state := ancestorState(parent); state != "" {
+		hit.kind = state
+		return hit
+	}
+	box := textNodeBox(pp, id)
+	if box == nil || box.Width < 1 || box.Height < 1 {
+		hit.kind = "clipped"
+		return hit
+	}
+	hit.box = formatBox(box)
+	if !boxInViewport(parent, box) {
+		hit.kind = "offscreen"
+		return hit
+	}
+	if clippedByAncestor(parent, box) {
+		hit.kind = "clipped"
+		return hit
+	}
+	if textCovered(pp, raw.BackendNodeID, parent, box) {
+		hit.kind = "covered"
+		return hit
+	}
+	hit.kind = "visible"
+	hit.visible = true
+	return hit
 }
 
 func hintSkippedNode(el *rod.Element) bool {
+	if el == nil {
+		return true
+	}
 	node, err := el.Describe(0, false)
 	if err != nil || node == nil {
 		return false
@@ -366,7 +446,7 @@ func hintSkippedNode(el *rod.Element) bool {
 	}
 }
 
-func hintVisibility(el *rod.Element) string {
+func ancestorState(el *rod.Element) string {
 	cur := el
 	for i := 0; i < 8 && cur != nil; i++ {
 		vis, err := cur.Visible()
@@ -386,18 +466,122 @@ func hintVisibility(el *rod.Element) string {
 		}
 		cur = parent
 	}
+	return ""
+}
+
+func textNodeBox(pp *rod.Page, id proto.DOMNodeID) *proto.DOMRect {
+	quads, err := proto.DOMGetContentQuads{NodeID: id}.Call(pp)
+	if err != nil || quads == nil || len(quads.Quads) == 0 {
+		return nil
+	}
+	return proto.Shape(quads.Quads).Box()
+}
+
+func clippedByAncestor(el *rod.Element, text *proto.DOMRect) bool {
+	cur := el
+	for i := 0; i < 8 && cur != nil; i++ {
+		if clipsOverflow(cur) {
+			outer := paddingBox(cur)
+			if outer != nil && !boxInside(text, outer) {
+				return true
+			}
+		}
+		node, err := cur.Describe(0, false)
+		if err != nil || node == nil || node.NodeName == "BODY" || node.NodeName == "HTML" {
+			break
+		}
+		parent, err := cur.Parent()
+		if err != nil {
+			break
+		}
+		cur = parent
+	}
+	return false
+}
+
+func clipsOverflow(el *rod.Element) bool {
+	for _, name := range []string{"overflow", "overflow-x", "overflow-y"} {
+		switch styleValue(el, name) {
+		case "hidden", "scroll", "auto", "clip":
+			return true
+		}
+	}
+	return false
+}
+
+func paddingBox(el *rod.Element) *proto.DOMRect {
+	node, err := el.Describe(0, false)
+	if err != nil || node == nil || node.NodeID == 0 {
+		return nil
+	}
+	model, err := proto.DOMGetBoxModel{NodeID: node.NodeID}.Call(el)
+	if err != nil || model == nil || model.Model == nil {
+		return nil
+	}
+	return proto.Shape{model.Model.Padding}.Box()
+}
+
+func textCovered(pp *rod.Page, textBackend proto.DOMBackendNodeID, parent *rod.Element, box *proto.DOMRect) bool {
+	hit, err := proto.DOMGetNodeForLocation{
+		X: int(box.X + box.Width/2),
+		Y: int(box.Y + box.Height/2),
+	}.Call(pp)
+	if err != nil || hit == nil {
+		return true
+	}
+	if hit.BackendNodeID == textBackend {
+		return false
+	}
+	parentNode, err := parent.Describe(0, false)
+	if err != nil || parentNode == nil {
+		return true
+	}
+	return hit.BackendNodeID != parentNode.BackendNodeID
+}
+
+func elementBox(pp *rod.Page, id proto.DOMNodeID) string {
+	el, err := pp.ElementFromNode(&proto.DOMNode{NodeID: id})
+	if err != nil {
+		return "-"
+	}
 	shape, err := el.Shape()
 	if err != nil || shape == nil || shape.Box() == nil {
-		return "clipped"
+		return "-"
 	}
-	box := shape.Box()
-	if box.Width < 1 || box.Height < 1 {
-		return "clipped"
+	return formatBox(shape.Box())
+}
+
+func formatBox(box *proto.DOMRect) string {
+	if box == nil {
+		return "-"
 	}
-	if !boxInViewport(el, box) {
-		return "offscreen"
+	return fmt.Sprintf("%.0f,%.0f,%.0f,%.0f", box.X, box.Y, box.Width, box.Height)
+}
+
+func boxInside(inner, outer *proto.DOMRect) bool {
+	const slop = 1.0
+	return inner.X >= outer.X-slop &&
+		inner.Y >= outer.Y-slop &&
+		inner.X+inner.Width <= outer.X+outer.Width+slop &&
+		inner.Y+inner.Height <= outer.Y+outer.Height+slop
+}
+
+func styleValue(el *rod.Element, name string) string {
+	node, err := el.Describe(0, false)
+	if err != nil || node == nil || node.NodeID == 0 {
+		return ""
 	}
-	return "visible"
+	_ = proto.CSSEnable{}.Call(el)
+	styles, err := proto.CSSGetComputedStyleForNode{NodeID: node.NodeID}.Call(el)
+	if err != nil || styles == nil {
+		return ""
+	}
+	for _, item := range styles.ComputedStyle {
+		if item.Name == name {
+			return item.Value
+		}
+	}
+	return ""
 }
 
 func elementOpacity(el *rod.Element) (float64, bool) {

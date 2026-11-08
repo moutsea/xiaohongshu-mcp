@@ -190,6 +190,7 @@ func TestFetchSiteLoadHint(t *testing.T) {
 			document.body.append(cover);
 			const tip = document.createElement("div");
 			tip.textContent = "薯队长遇到了点小麻烦";
+			tip.style.cssText = "position:fixed;z-index:30;top:8px;left:8px;background:#fff";
 			document.body.append(tip);
 			const a = document.createElement("a");
 			a.id = "login-btn";
@@ -209,7 +210,9 @@ func TestFetchSiteLoadHint(t *testing.T) {
 	require.Empty(t, img)
 	require.Less(t, time.Since(start), 8*time.Second)
 	text := strings.Join(hook.lines, "\n")
-	require.Contains(t, text, "取码停止：站点加载错误 match=visible")
+	require.Contains(t, text, "取码停止：站点加载错误 node=text whitelist=1")
+	require.Contains(t, text, "kind=visible")
+	require.NotContains(t, text, "薯队长遇到了点小麻烦")
 	require.NotContains(t, text, "点击可见登录入口")
 	require.NotContains(t, text, "登录入口被遮挡")
 }
@@ -232,15 +235,23 @@ func TestSiteHintVisibility(t *testing.T) {
 		{"offscreen", `<div style="position:absolute;left:-9999px;top:0">` + phrase + `</div>`, false, "offscreen"},
 		{"opacity0", `<div style="opacity:0">` + phrase + `</div>`, false, "transparent"},
 		{"clip", `<div style="height:0;overflow:hidden">` + phrase + `</div>`, false, "clipped"},
+		{"ancestor-clip", `<section style="height:20px;overflow:hidden;width:220px"><p style="margin:0;height:20px">可见行</p><p style="margin:0">` + phrase + `</p></section>`, false, "clipped"},
+		{"text-in-clip", `<div style="height:20px;overflow:hidden;width:240px">可见行<br>` + phrase + `</div>`, false, "clipped"},
+		{"covered", `<div>` + phrase + `</div><div style="position:fixed;inset:0;background:#fff;z-index:5"></div>`, false, "covered"},
+		{"title", `<button title="` + phrase + `">登录</button>`, false, "attribute"},
+		{"aria", `<button aria-label="` + phrase + `">登录</button>`, false, "attribute"},
+		{"parent-opacity", `<div style="opacity:0"><div>` + phrase + `</div></div>`, false, "transparent"},
+		{"extra-text", `<div>前缀` + phrase + `</div>`, false, "other"},
 		{"visible", `<div>` + phrase + `</div>`, true, "visible"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			require.NoError(t, page.SetDocumentContent(`<!doctype html><html><body>`+tc.html+`</body></html>`))
-			visible, kind, err := siteQRHint(page)
+			hit, err := siteQRHint(page)
 			require.NoError(t, err)
-			require.Equal(t, tc.visible, visible)
-			require.Equal(t, tc.kind, kind)
+			require.Equal(t, tc.visible, hit.visible)
+			require.Equal(t, tc.kind, hit.kind)
+			require.NotContains(t, hit.box, phrase)
 		})
 	}
 }
@@ -267,8 +278,10 @@ func TestFetchOffscreenHintWaitsForQR(t *testing.T) {
 	require.Greater(t, time.Since(start), 3*time.Second)
 	require.Less(t, time.Since(start), 12*time.Second)
 	text := strings.Join(hook.lines, "\n")
-	require.Contains(t, text, "取码提示：忽略非可见匹配 kind=offscreen")
+	require.Contains(t, text, "取码提示：node=text whitelist=1")
+	require.Contains(t, text, "kind=offscreen")
 	require.NotContains(t, text, "站点加载错误")
+	require.NotContains(t, text, "薯队长遇到了点小麻烦")
 }
 
 func TestFetchReadyQRIgnoresVisibleHint(t *testing.T) {
