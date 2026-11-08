@@ -135,7 +135,119 @@ func TestFetchWaitsWhenLoginButtonCovered(t *testing.T) {
 	require.Equal(t, loginQrSrc, img)
 	require.Greater(t, time.Since(start), 3*time.Second)
 	require.Less(t, time.Since(start), 12*time.Second)
-	require.Contains(t, strings.Join(hook.lines, "\n"), "取码点击：登录框已在，等待二维码节点")
+	require.Contains(t, strings.Join(hook.lines, "\n"), "取码观察：登录框已在，等待二维码节点")
+}
+
+func TestFetchObservesLateModal(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	html := `<!doctype html><html><body><div id="global" data-logged="0"></div><script>
+		setTimeout(() => {
+			const cover = document.createElement("div");
+			cover.className = "login-container";
+			cover.style.cssText = "position:fixed;inset:0;z-index:20;background:#fff";
+			cover.innerHTML = '<div>登录后查看搜索结果</div><img class="qrcode-img" src="">';
+			document.body.append(cover);
+			const a = document.createElement("a");
+			a.id = "login-btn";
+			a.textContent = "登录";
+			a.style.cssText = "display:inline-block;width:120px;height:48px";
+			document.body.append(a);
+		}, 3500);
+		setTimeout(() => {
+			const img = document.querySelector(".login-container .qrcode-img");
+			if (img) img.setAttribute("src", "` + loginQrSrc + `");
+		}, 4500);
+	</script></body></html>`
+	serveExploreFixture(t, page, html, nil)
+	hook := &logCapture{}
+	logrus.AddHook(hook)
+	t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks)) })
+	start := time.Now()
+	img, loggedIn, err := NewLogin(page).FetchQrcodeImage(context.Background())
+	require.NoError(t, err)
+	require.False(t, loggedIn)
+	require.Equal(t, loginQrSrc, img)
+	require.Greater(t, time.Since(start), 4*time.Second)
+	require.Less(t, time.Since(start), 12*time.Second)
+	text := strings.Join(hook.lines, "\n")
+	require.Contains(t, text, "取码观察：登录框已在，等待二维码节点")
+	require.NotContains(t, text, "点击可见登录入口")
+	require.NotContains(t, text, "登录入口被遮挡")
+}
+
+func TestFetchSiteLoadHint(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	html := `<!doctype html><html><body><div id="global" data-logged="0"></div><script>
+		setTimeout(() => {
+			const cover = document.createElement("div");
+			cover.className = "login-container";
+			cover.style.cssText = "position:fixed;inset:0;z-index:20;background:#fff";
+			cover.innerHTML = '<div>登录后查看搜索结果</div><div>可用小红书或微信扫码</div><img class="qrcode-img" src="">';
+			document.body.append(cover);
+			const tip = document.createElement("div");
+			tip.textContent = "薯队长遇到了点小麻烦";
+			document.body.append(tip);
+			const a = document.createElement("a");
+			a.id = "login-btn";
+			a.textContent = "登录";
+			a.style.cssText = "display:inline-block;width:120px;height:48px";
+			document.body.append(a);
+		}, 3000);
+	</script></body></html>`
+	serveExploreFixture(t, page, html, nil)
+	hook := &logCapture{}
+	logrus.AddHook(hook)
+	t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks)) })
+	start := time.Now()
+	img, loggedIn, err := NewLogin(page).FetchQrcodeImage(context.Background())
+	require.ErrorIs(t, err, errSiteQRLoad)
+	require.False(t, loggedIn)
+	require.Empty(t, img)
+	require.Less(t, time.Since(start), 8*time.Second)
+	text := strings.Join(hook.lines, "\n")
+	require.Contains(t, text, "取码停止：站点加载错误")
+	require.NotContains(t, text, "点击可见登录入口")
+	require.NotContains(t, text, "登录入口被遮挡")
+}
+
+func TestFetchHiddenButton(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	html := `<!doctype html><html><body><a id="login-btn" style="display:none">登录</a></body></html>`
+	serveExploreFixture(t, page, html, nil)
+	start := time.Now()
+	img, loggedIn, err := NewLogin(page).FetchQrcodeImage(context.Background())
+	require.EqualError(t, err, "登录入口不可点击")
+	require.False(t, loggedIn)
+	require.Empty(t, img)
+	require.GreaterOrEqual(t, time.Since(start), qrcodeWaitTimeout)
+	require.Less(t, time.Since(start), 25*time.Second)
+}
+
+func TestFetchLateAccessLimit(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	html := `<!doctype html><html><body><div id="global" data-logged="0"></div><script>
+		setTimeout(() => {
+			const box = document.createElement("div");
+			box.className = "access-wrapper";
+			box.innerHTML = '<img class="qrcode-img" src="data:image/png;base64,ACCESS">';
+			document.body.append(box);
+		}, 3000);
+	</script></body></html>`
+	serveExploreFixture(t, page, html, nil)
+	start := time.Now()
+	img, loggedIn, err := NewLogin(page).FetchQrcodeImage(context.Background())
+	require.ErrorIs(t, err, errPageAccessLimited)
+	require.False(t, loggedIn)
+	require.Empty(t, img)
+	require.Less(t, time.Since(start), 10*time.Second)
 }
 
 func TestFetchUsesSearchResult(t *testing.T) {
@@ -182,7 +294,7 @@ func TestFetchQrcodeImageLocal(t *testing.T) {
 		require.False(t, loggedIn)
 		require.Empty(t, img)
 		require.GreaterOrEqual(t, elapsed, loginEntryTimeout)
-		require.Less(t, elapsed, 20*time.Second)
+		require.Less(t, elapsed, 25*time.Second)
 		t.Logf("missing selector elapsed=%s err=%v", elapsed, err)
 	})
 
@@ -218,9 +330,12 @@ func TestFetchQrcodeImageLocal(t *testing.T) {
 		t.Cleanup(func() { _ = page.Close() })
 		serveExploreFixture(t, page, `<!doctype html><html><body><div class="login-container"><img class="qrcode-img" src=""></div></body></html>`, nil)
 
+		start := time.Now()
 		_, loggedIn, err := NewLogin(page).FetchQrcodeImage(context.Background())
-		require.ErrorContains(t, err, "qrcode src is empty")
+		require.ErrorContains(t, err, "登录框未出现登录二维码")
 		require.False(t, loggedIn)
+		require.GreaterOrEqual(t, time.Since(start), qrcodeWaitTimeout)
+		require.Less(t, time.Since(start), 25*time.Second)
 	})
 
 	t.Run("调用方取消后不必等满超时", func(t *testing.T) {

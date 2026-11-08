@@ -26,10 +26,13 @@ const (
 	exploreSettle     = 2 * time.Second
 	// 侧栏登录入口。公开页面 #login-btn 文案是「登录」。
 	loginEntryTimeout = 8 * time.Second
-	// 等登录框里的二维码。扫码本身的等待在 WaitForLogin 里，不受这个限制。
+	// 登录框、二维码、可见入口共用这一段，只观察一轮，不叠加、不重试。
 	qrcodeWaitTimeout = 15 * time.Second
-	// 导航、入口、等二维码加起来仍低于宿主 60 秒。
+	loginObserveTick  = 200 * time.Millisecond
+	// 导航加上这一轮观察仍低于宿主 60 秒。
 	fetchQrcodeBudget = 50 * time.Second
+	// 公开弹窗上的站点提示。出现时二维码区域是空的，不是按钮被挡住。
+	siteQRLoadHint = "薯队长遇到了点小麻烦"
 )
 
 // 公开页面上的登录二维码。点开登录框后出现；App 下载码不在这个节点里。
@@ -56,7 +59,16 @@ const (
 )
 
 var errPageAccessLimited = errors.New("页面出现访问限制，已停止")
+var errSiteQRLoad = errors.New("站点加载登录二维码失败")
 var errNotLoggedIn = errors.New("未登录，无法打开个人主页")
+
+type entryMiss int
+
+const (
+	entryMissNone entryMiss = iota
+	entryMissCovered
+	entryMissHidden
+)
 
 // loginObservation 是当前公开页面的登录判断，不是 cookie 或内部接口的结果。
 type loginObservation struct {
@@ -178,32 +190,165 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	var diag string
 	logLoginDiag(pp, view.Kind, &diag)
 
-	// 登录框已经开着时直接取码，不再点入口。
+	src, err := observeLoginQrcode(pp)
+	return src, false, err
+}
+
+// observeLoginQrcode 在同一段时限内看登录框、二维码和可见入口。
+// 登录框出现后不再点击。只点击一次真正可交互的入口。不刷新、不重新导航。
+func observeLoginQrcode(pp *rod.Page) (string, error) {
+	deadline := time.Now().Add(qrcodeWaitTimeout)
+	clicked := false
+	sawButton := false
+	miss := entryMissNone
+	announcedModal := false
+	var diag string
+	for {
+		src, done, err := pollLoginQrcode(pp, &clicked, &sawButton, &miss, &announcedModal, &diag)
+		if done || err != nil {
+			return src, err
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		if err := sleepObserve(pp); err != nil {
+			return "", err
+		}
+	}
+	return "", loginObserveTimeout(pp, clicked, sawButton, miss)
+}
+
+func pollLoginQrcode(pp *rod.Page, clicked, sawButton *bool, miss *entryMiss, announcedModal *bool, diag *string) (string, bool, error) {
+	if err := pp.GetContext().Err(); err != nil {
+		return "", true, errors.Wrap(err, "等待登录二维码时被取消")
+	}
+	if err := pageBlocked(pp); err != nil {
+		return "", true, err
+	}
+	failed, err := siteQRLoadFailed(pp)
+	if err != nil {
+		return "", true, err
+	}
+	if failed {
+		logrus.Info("取码停止：站点加载错误")
+		return "", true, errSiteQRLoad
+	}
 	if src, found, err := existingLoginQrcode(pp); err != nil || found {
 		if err == nil && found {
-			logrus.Info("取码点击：已有二维码")
+			logrus.Info("取码观察：已有二维码")
 		}
-		return src, false, err
+		return src, true, err
 	}
-	// 登录框节点已经盖住侧栏时，点击会被挡住直到超时。改为等二维码节点。
-	if hasSelector(pp, ".login-container") {
-		logrus.Info("取码点击：登录框已在，等待二维码节点")
-	} else {
-		logrus.Info("取码点击：点击可见登录入口")
-		if err := openVisibleLoginEntry(pp); err != nil {
-			return "", false, err
+	modal := hasSelector(pp, ".login-container")
+	if loginDiagOn() {
+		kind := loginKindLoading
+		if modal {
+			kind = loginKindDialog
+		} else if hasSelector(pp, loginEntrySelector) {
+			kind = loginKindEntry
 		}
-		if err := pageBlocked(pp); err != nil {
-			return "", false, err
-		}
+		logLoginDiag(pp, kind, diag)
 	}
-
-	el, err := pp.Timeout(qrcodeWaitTimeout).Element(loginQrcodeSelector)
+	if modal {
+		if !*announcedModal {
+			logrus.Info("取码观察：登录框已在，等待二维码节点")
+			*announcedModal = true
+		}
+		return "", false, nil
+	}
+	if *clicked {
+		return "", false, nil
+	}
+	hit, buttonMiss, err := clickInteractableEntry(pp)
 	if err != nil {
-		return "", false, errors.Wrap(err, "登录框未出现登录二维码")
+		return "", true, err
 	}
-	src, err := qrcodeSrc(el)
-	return src, false, err
+	if hit {
+		*clicked = true
+		logrus.Info("取码观察：点击可见登录入口")
+		return "", false, nil
+	}
+	if buttonMiss != entryMissNone {
+		*sawButton = true
+		*miss = buttonMiss
+	}
+	return "", false, nil
+}
+
+func loginObserveTimeout(pp *rod.Page, clicked, sawButton bool, miss entryMiss) error {
+	failed, err := siteQRLoadFailed(pp)
+	if err != nil {
+		return err
+	}
+	if failed {
+		logrus.Info("取码停止：站点加载错误")
+		return errSiteQRLoad
+	}
+	if clicked || hasSelector(pp, ".login-container") {
+		return errors.New("登录框未出现登录二维码")
+	}
+	if !sawButton {
+		return errors.New("登录入口未出现")
+	}
+	if miss == entryMissCovered {
+		return errors.New("登录入口被遮挡")
+	}
+	return errors.New("登录入口不可点击")
+}
+
+func siteQRLoadFailed(pp *rod.Page) (bool, error) {
+	el, err := pp.Sleeper(rod.NotFoundSleeper).Element("body")
+	if err != nil {
+		if goerrors.Is(err, &rod.ElementNotFoundError{}) {
+			return false, nil
+		}
+		return false, errors.Wrap(err, "读取页面提示失败")
+	}
+	text, err := el.Text()
+	if err != nil {
+		return false, errors.Wrap(err, "读取页面提示失败")
+	}
+	return strings.Contains(text, siteQRLoadHint), nil
+}
+
+func clickInteractableEntry(pp *rod.Page) (bool, entryMiss, error) {
+	els, err := pp.Sleeper(rod.NotFoundSleeper).Elements(loginEntrySelector)
+	if err != nil && !goerrors.Is(err, &rod.ElementNotFoundError{}) {
+		return false, entryMissNone, errors.Wrap(err, "登录入口未出现")
+	}
+	miss := entryMissNone
+	for _, el := range els {
+		_, err := el.Timeout(400 * time.Millisecond).Interactable()
+		if err == nil {
+			if err := el.Timeout(3*time.Second).Click(proto.InputMouseButtonLeft, 1); err != nil {
+				return false, entryMissNone, errors.Wrap(err, "打开登录框失败")
+			}
+			return true, entryMissNone, nil
+		}
+		switch {
+		case goerrors.Is(err, &rod.CoveredError{}):
+			if miss != entryMissHidden {
+				miss = entryMissCovered
+			}
+		default:
+			miss = entryMissHidden
+		}
+	}
+	if len(els) == 0 {
+		return false, entryMissNone, nil
+	}
+	return false, miss, nil
+}
+
+func sleepObserve(pp *rod.Page) error {
+	timer := time.NewTimer(loginObserveTick)
+	defer timer.Stop()
+	select {
+	case <-pp.GetContext().Done():
+		return errors.Wrap(pp.GetContext().Err(), "等待登录二维码时被取消")
+	case <-timer.C:
+		return nil
+	}
 }
 
 func navigateExplore(pp *rod.Page, reason string) error {
@@ -252,44 +397,14 @@ func existingLoginQrcode(pp *rod.Page) (string, bool, error) {
 	if !ok {
 		return "", false, nil
 	}
-	src, err := qrcodeSrc(el)
+	src, err := el.Attribute("src")
 	if err != nil {
-		return "", false, err
+		return "", false, errors.Wrap(err, "get qrcode src failed")
 	}
-	return src, true, nil
-}
-
-func openVisibleLoginEntry(pp *rod.Page) error {
-	deadline := time.Now().Add(loginEntryTimeout)
-	saw := false
-	for time.Now().Before(deadline) {
-		if err := pp.GetContext().Err(); err != nil {
-			return errors.Wrap(err, "打开登录框失败")
-		}
-		els, err := pp.Sleeper(rod.NotFoundSleeper).Elements(loginEntrySelector)
-		if err != nil && !goerrors.Is(err, &rod.ElementNotFoundError{}) {
-			return errors.Wrap(err, "登录入口未出现")
-		}
-		if len(els) == 0 {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		saw = true
-		for _, el := range els {
-			if _, err := el.Timeout(400 * time.Millisecond).Interactable(); err != nil {
-				continue
-			}
-			if err := el.Timeout(3*time.Second).Click(proto.InputMouseButtonLeft, 1); err != nil {
-				return errors.Wrap(err, "打开登录框失败")
-			}
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
+	if src == nil || strings.TrimSpace(*src) == "" {
+		return "", false, nil
 	}
-	if !saw {
-		return errors.New("登录入口未出现")
-	}
-	return errors.New("登录入口被遮挡")
+	return *src, true, nil
 }
 
 func dash(s string) string {
@@ -297,17 +412,6 @@ func dash(s string) string {
 		return "-"
 	}
 	return s
-}
-
-func qrcodeSrc(el *rod.Element) (string, error) {
-	src, err := el.Attribute("src")
-	if err != nil {
-		return "", errors.Wrap(err, "get qrcode src failed")
-	}
-	if src == nil || len(*src) == 0 {
-		return "", errors.New("qrcode src is empty")
-	}
-	return *src, nil
 }
 
 // WaitForLogin 只观察当前页。扫码后的跨域跳转由站点自己完成，这里不再打开探索页。
