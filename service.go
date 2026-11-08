@@ -188,17 +188,23 @@ func (s *XiaohongshuService) waitScanInBackground(
 		defer cancel()
 		defer s.logins.finish(seq)
 
-		if loginAction.WaitForLogin(ctxTimeout) {
-			if err := saveCookies(page); err != nil {
-				logrus.Errorf("扫码成功但保存 cookies 失败，会话 #%d: %v", seq, err)
-				return
-			}
-			logrus.Infof("扫码登录成功，cookies 已保存，会话 #%d", seq)
+		ok, err := loginAction.WaitForLogin(ctxTimeout)
+		if err != nil {
+			logrus.Errorf("登录会话 #%d 停止：%v", seq, err)
+			return
+		}
+		if !ok {
+			logrus.Infof("登录会话 #%d 结束，未确认账号入口", seq)
 			return
 		}
 
-		// 没等到扫码：要么超时，要么被新取的二维码取代
-		logrus.Infof("登录会话 #%d 结束，未检测到扫码（超时或已被新的二维码取代）", seq)
+		// 先保存再由 defer 关闭浏览器。保存失败不能记成登录成功。
+		logrus.Infof("登录会话 #%d 已看到账号入口，开始保存 cookies", seq)
+		if err := saveCookies(page); err != nil {
+			logrus.Errorf("登录会话 #%d 保存 cookies 失败：%v", seq, err)
+			return
+		}
+		logrus.Infof("登录会话 #%d cookies 已保存", seq)
 	}()
 }
 
@@ -637,8 +643,13 @@ func saveCookies(page *rod.Page) error {
 		return err
 	}
 
-	cookieLoader := cookies.NewLoadCookie(cookies.GetCookiesFilePath())
-	return cookieLoader.SaveCookies(data)
+	cookiePath := cookies.GetCookiesFilePath()
+	cookieLoader := cookies.NewLoadCookie(cookiePath)
+	if err := cookieLoader.SaveCookies(data); err != nil {
+		return err
+	}
+	logrus.Infof("cookies 已写入：path=%s bytes=%d", cookiePath, len(data))
+	return nil
 }
 
 // withBrowserPage 执行需要浏览器页面的操作的通用函数

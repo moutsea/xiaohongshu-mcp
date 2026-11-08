@@ -172,3 +172,32 @@ func TestSaveCookies_CreatesParentDir(t *testing.T) {
 	assert.NoError(t, json.Unmarshal(got, &cks))
 	assert.Equal(t, "a", cks[0]["name"])
 }
+
+func TestSaveCookies_ParentIsFile(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "not-a-dir")
+	assert.NoError(t, os.WriteFile(blocker, []byte("x"), 0600))
+
+	err := NewLoadCookie(filepath.Join(blocker, "cookies.json")).SaveCookies([]byte(`[{"name":"a","value":"b"}]`))
+	assert.Error(t, err)
+	info, statErr := os.Stat(blocker)
+	assert.NoError(t, statErr)
+	assert.False(t, info.IsDir())
+}
+
+func TestSaveCookies_AtomicMode0600(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cookies.json")
+	c := NewLoadCookie(path)
+
+	assert.NoError(t, c.SaveCookies([]byte(`[{"name":"a","value":"b"}]`)))
+
+	info, err := os.Stat(path)
+	assert.NoError(t, err)
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+
+	entries, err := os.ReadDir(dir)
+	assert.NoError(t, err)
+	assert.Len(t, entries, 1)
+	assert.Equal(t, "cookies.json", entries[0].Name())
+}
