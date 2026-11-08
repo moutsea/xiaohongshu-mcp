@@ -173,17 +173,29 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 		return "", true, nil
 	}
 
+	host, path := safeLocation(frameURL(pp))
+	logrus.Infof("取码页面：host=%s path=%s", dash(host), dash(path))
+	var diag string
+	logLoginDiag(pp, view.Kind, &diag)
+
 	// 登录框已经开着时直接取码，不再点入口。
 	if src, found, err := existingLoginQrcode(pp); err != nil || found {
+		if err == nil && found {
+			logrus.Info("取码点击：已有二维码")
+		}
 		return src, false, err
 	}
-
-	// 没有现成登录框时，只点一次可见入口。
-	if err := openLoginEntry(pp); err != nil {
-		return "", false, err
-	}
-	if err := pageBlocked(pp); err != nil {
-		return "", false, err
+	// 登录框节点已经盖住侧栏时，点击会被挡住直到超时。改为等二维码节点。
+	if hasSelector(pp, ".login-container") {
+		logrus.Info("取码点击：登录框已在，等待二维码节点")
+	} else {
+		logrus.Info("取码点击：点击可见登录入口")
+		if err := openVisibleLoginEntry(pp); err != nil {
+			return "", false, err
+		}
+		if err := pageBlocked(pp); err != nil {
+			return "", false, err
+		}
 	}
 
 	el, err := pp.Timeout(qrcodeWaitTimeout).Element(loginQrcodeSelector)
@@ -247,15 +259,44 @@ func existingLoginQrcode(pp *rod.Page) (string, bool, error) {
 	return src, true, nil
 }
 
-func openLoginEntry(pp *rod.Page) error {
-	el, err := pp.Timeout(loginEntryTimeout).Element(loginEntrySelector)
-	if err != nil {
-		return errors.Wrap(err, "登录入口未出现")
+func openVisibleLoginEntry(pp *rod.Page) error {
+	deadline := time.Now().Add(loginEntryTimeout)
+	saw := false
+	for time.Now().Before(deadline) {
+		if err := pp.GetContext().Err(); err != nil {
+			return errors.Wrap(err, "打开登录框失败")
+		}
+		els, err := pp.Sleeper(rod.NotFoundSleeper).Elements(loginEntrySelector)
+		if err != nil && !goerrors.Is(err, &rod.ElementNotFoundError{}) {
+			return errors.Wrap(err, "登录入口未出现")
+		}
+		if len(els) == 0 {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		saw = true
+		for _, el := range els {
+			if _, err := el.Timeout(400 * time.Millisecond).Interactable(); err != nil {
+				continue
+			}
+			if err := el.Timeout(3*time.Second).Click(proto.InputMouseButtonLeft, 1); err != nil {
+				return errors.Wrap(err, "打开登录框失败")
+			}
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return errors.Wrap(err, "打开登录框失败")
+	if !saw {
+		return errors.New("登录入口未出现")
 	}
-	return nil
+	return errors.New("登录入口被遮挡")
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func qrcodeSrc(el *rod.Element) (string, error) {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	xhserrors "github.com/xpzouying/xiaohongshu-mcp/errors"
 )
@@ -111,6 +112,30 @@ func serveExploreFixture(t *testing.T, page *rod.Page, document string, beforeRe
 	})
 	go router.Run()
 	t.Cleanup(func() { _ = router.Stop() })
+}
+
+func TestFetchWaitsWhenLoginButtonCovered(t *testing.T) {
+	b := newSearchFixtureBrowser(t)
+	page := b.MustPage("about:blank")
+	t.Cleanup(func() { _ = page.Close() })
+	html := `<!doctype html><html><body>` +
+		`<div class="login-container" style="position:fixed;inset:0;z-index:5"></div>` +
+		`<a id="login-btn" href="/login" style="display:inline-block;width:120px;height:48px">登录</a>` +
+		`<script>setTimeout(() => {` +
+		`document.querySelector(".login-container").innerHTML = '<img class="qrcode-img" src="` + loginQrSrc + `">';` +
+		`}, 4000);</script></body></html>`
+	serveExploreFixture(t, page, html, nil)
+	hook := &logCapture{}
+	logrus.AddHook(hook)
+	t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks)) })
+	start := time.Now()
+	img, loggedIn, err := NewLogin(page).FetchQrcodeImage(context.Background())
+	require.NoError(t, err)
+	require.False(t, loggedIn)
+	require.Equal(t, loginQrSrc, img)
+	require.Greater(t, time.Since(start), 3*time.Second)
+	require.Less(t, time.Since(start), 12*time.Second)
+	require.Contains(t, strings.Join(hook.lines, "\n"), "取码点击：登录框已在，等待二维码节点")
 }
 
 func TestFetchUsesSearchResult(t *testing.T) {
