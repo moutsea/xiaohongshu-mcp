@@ -166,39 +166,52 @@ func TestWaitForLoginFixtures(t *testing.T) {
 	t.Run("关掉登录框不会成功", func(t *testing.T) {
 		page := b.MustPage("about:blank")
 		t.Cleanup(func() { _ = page.Close() })
-		var nav atomic.Int32
+		var exploreNav atomic.Int32
 		serveNavigation(t, page, func(h *rod.Hijack) {
 			h.Response.SetHeader("Content-Type", "text/html; charset=utf-8")
-			if nav.Add(1) == 1 {
-				h.Response.SetBody(loginDialogThenClosedHTML)
-				return
+			if strings.HasPrefix(h.Request.URL().String(), exploreFixtureURL) {
+				exploreNav.Add(1)
 			}
-			h.Response.SetBody(dialogClosedFixtureHTML)
+			h.Response.SetBody(loginDialogThenClosedHTML)
 		})
 		require.NoError(t, page.Timeout(5*time.Second).Navigate(exploreFixtureURL))
 		require.NoError(t, page.Timeout(5*time.Second).WaitLoad())
+		baseline := exploreNav.Load()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 		defer cancel()
 		ok, err := NewLogin(page).WaitForLogin(ctx)
 		require.NoError(t, err)
 		require.False(t, ok)
+		require.Equal(t, baseline, exploreNav.Load())
 	})
 
-	t.Run("关掉登录框后重新打开才看到账号", func(t *testing.T) {
+	t.Run("加载超过3秒后由站点跳转出现账号", func(t *testing.T) {
 		page := b.MustPage("about:blank")
 		t.Cleanup(func() { _ = page.Close() })
-		var nav atomic.Int32
+		var exploreNav atomic.Int32
 		serveNavigation(t, page, func(h *rod.Hijack) {
 			h.Response.SetHeader("Content-Type", "text/html; charset=utf-8")
-			if nav.Add(1) == 1 {
-				h.Response.SetBody(loginDialogThenClosedHTML)
-				return
+			switch {
+			case strings.HasPrefix(h.Request.URL().String(), exploreFixtureURL):
+				exploreNav.Add(1)
+				h.Response.SetBody(emptyFixtureHTML)
+			case strings.HasPrefix(h.Request.URL().String(), rednoteFixtureURL):
+				h.Response.SetBody(loginDialogThenRedirectHTML)
+			case strings.HasPrefix(h.Request.URL().String(), afterScanURL):
+				time.Sleep(4 * time.Second)
+				h.Response.SetBody(loggedInFixtureHTML)
+			default:
+				h.Response.SetBody(emptyFixtureHTML)
 			}
-			h.Response.SetBody(loggedInFixtureHTML)
 		})
-		require.NoError(t, page.Timeout(5*time.Second).Navigate(exploreFixtureURL))
+		require.NoError(t, page.Timeout(5*time.Second).Navigate(rednoteFixtureURL))
 		require.NoError(t, page.Timeout(5*time.Second).WaitLoad())
+		baseline := exploreNav.Load()
+
+		hook := &logCapture{}
+		logrus.AddHook(hook)
+		t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks)) })
 
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
@@ -206,7 +219,59 @@ func TestWaitForLoginFixtures(t *testing.T) {
 		ok, err := NewLogin(page).WaitForLogin(ctx)
 		require.NoError(t, err)
 		require.True(t, ok)
-		require.GreaterOrEqual(t, time.Since(start), loginRecheckAfter)
+		require.Greater(t, time.Since(start), 3*time.Second)
+		require.Equal(t, baseline, exploreNav.Load())
+		text := strings.Join(hook.lines, "\n")
+		require.Contains(t, text, "站点自身跳转")
+		require.Contains(t, text, "不主动打开新页面")
+		require.NotContains(t, text, "重新打开首页")
+		require.NotContains(t, text, "程序导航")
+	})
+
+	t.Run("同页慢渲染后出现账号", func(t *testing.T) {
+		page := b.MustPage("about:blank")
+		t.Cleanup(func() { _ = page.Close() })
+		var exploreNav atomic.Int32
+		serveNavigation(t, page, func(h *rod.Hijack) {
+			h.Response.SetHeader("Content-Type", "text/html; charset=utf-8")
+			if strings.HasPrefix(h.Request.URL().String(), exploreFixtureURL) {
+				exploreNav.Add(1)
+			}
+			h.Response.SetBody(slowAccountHTML)
+		})
+		require.NoError(t, page.Timeout(5*time.Second).Navigate(exploreFixtureURL))
+		require.NoError(t, page.Timeout(5*time.Second).WaitLoad())
+		baseline := exploreNav.Load()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		start := time.Now()
+		ok, err := NewLogin(page).WaitForLogin(ctx)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Greater(t, time.Since(start), 3*time.Second)
+		require.Equal(t, baseline, exploreNav.Load())
+	})
+
+	t.Run("游客跳转不能成功", func(t *testing.T) {
+		page := b.MustPage("about:blank")
+		t.Cleanup(func() { _ = page.Close() })
+		serveNavigation(t, page, func(h *rod.Hijack) {
+			h.Response.SetHeader("Content-Type", "text/html; charset=utf-8")
+			if strings.HasPrefix(h.Request.URL().String(), afterScanURL) {
+				h.Response.SetBody(guestFixtureHTML)
+				return
+			}
+			h.Response.SetBody(loginDialogThenRedirectHTML)
+		})
+		require.NoError(t, page.Timeout(5*time.Second).Navigate(rednoteFixtureURL))
+		require.NoError(t, page.Timeout(5*time.Second).WaitLoad())
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ok, err := NewLogin(page).WaitForLogin(ctx)
+		require.NoError(t, err)
+		require.False(t, ok)
 	})
 
 	t.Run("验证限制立即停止", func(t *testing.T) {
@@ -237,6 +302,22 @@ func TestToProfilePageLoggedOutReturns(t *testing.T) {
 	require.ErrorIs(t, err, errNotLoggedIn)
 	require.Less(t, time.Since(start), 10*time.Second)
 }
+
+const afterScanURL = "https://www.xiaohongshu.com/after-scan"
+
+const loginDialogThenRedirectHTML = `<!doctype html><html><body><div id="global" data-logged="0">` +
+	`<div id="app"></div><div class="main-container">` +
+	`<div class="login-container"><img class="qrcode-img" src="` + loginQrSrc + `"></div>` +
+	`</div></div><script>setTimeout(() => { location.href = "` + afterScanURL + `"; }, 200);</script></body></html>`
+
+const slowAccountHTML = `<!doctype html><html><body><div id="global" data-logged="0">` +
+	`<div id="app"></div><div class="main-container" id="main">` +
+	`<div class="login-container" id="dialog"><img class="qrcode-img" src="` + loginQrSrc + `"></div>` +
+	`</div></div><script>setTimeout(() => {` +
+	`document.getElementById("dialog").remove();` +
+	`document.getElementById("global").setAttribute("data-logged","1");` +
+	`document.getElementById("main").innerHTML = '<li class="user side-bar-component"><a class="link-wrapper" href="/user/profile/fixture-user"><span class="channel">我</span></a></li>';` +
+	`}, 4000);</script></body></html>`
 
 const loginDialogThenClosedHTML = `<!doctype html><html><body><div id="global" data-logged="0">` +
 	`<div id="app"></div><div class="main-container">` +

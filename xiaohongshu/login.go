@@ -39,9 +39,6 @@ const accessLimitSelector = ".access-wrapper, .access-container"
 // 已登录侧栏入口。公开页面只在 loggedIn 时渲染，href 指向 /user/profile/<id>。
 const accountLinkSelector = "div.main-container li.user.side-bar-component a.link-wrapper"
 
-// 登录框关掉后，隔这一小段再打开首页核对一次。框还在时不刷新，避免打断扫码。
-const loginRecheckAfter = 3 * time.Second
-
 const (
 	loginKindAccount  = "sidebar-profile-link"
 	loginKindGuest    = "guest"
@@ -73,7 +70,7 @@ func NewLogin(page *rod.Page) *LoginAction {
 
 func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
 	pp := a.page.Context(ctx)
-	if err := navigateExplore(pp); err != nil {
+	if err := navigateExplore(pp, "检查登录状态"); err != nil {
 		return false, err
 	}
 	if err := settle(pp.GetContext()); err != nil {
@@ -147,7 +144,7 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	defer cancel()
 	pp := a.page.Context(ctx)
 
-	if err := navigateExplore(pp); err != nil {
+	if err := navigateExplore(pp, "获取登录二维码"); err != nil {
 		return "", false, err
 	}
 	if err := pageBlocked(pp); err != nil {
@@ -192,7 +189,8 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	return src, false, err
 }
 
-func navigateExplore(pp *rod.Page) error {
+func navigateExplore(pp *rod.Page, reason string) error {
+	logrus.Infof("程序导航：%s url=%s", reason, exploreURL)
 	nav := pp.Timeout(exploreNavTimeout)
 	if err := nav.Navigate(exploreURL); err != nil {
 		return errors.Wrap(err, "open explore failed")
@@ -265,31 +263,33 @@ func qrcodeSrc(el *rod.Element) (string, error) {
 	return *src, nil
 }
 
-// WaitForLogin 在当前页轮询账号入口。ctx 由调用方单独计时，不用取码的短超时。
-// 只有侧栏个人主页链接算成功。登录框消失、下载码、过期二维码都不会成功。
+// WaitForLogin 只观察当前页。扫码后的跨域跳转由站点自己完成，这里不再打开探索页。
+// 只有侧栏个人主页链接算成功。登录框消失、加载中、下载码、过期二维码都不会成功。
 func (a *LoginAction) WaitForLogin(ctx context.Context) (bool, error) {
-	logrus.Info("等待扫码确认：开始轮询账号入口")
+	logrus.Info("等待扫码确认：开始轮询账号入口，不主动打开新页面")
 	pp := a.page.Context(ctx)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	var lastKind, lastHost string
-	var sawLoginUI bool
-	var dialogGoneAt time.Time
-	var rechecked bool
-
+	noteHost := func() {
+		host := pageHost(pp)
+		if host == "" || host == lastHost {
+			return
+		}
+		if lastHost != "" {
+			logrus.Infof("站点自身跳转：%s -> %s", lastHost, host)
+		}
+		lastHost = host
+	}
 	for {
 		if ctx.Err() != nil {
 			logrus.Infof("等待扫码确认结束：%s，最后状态=%s", ctx.Err(), lastKind)
 			return false, nil
 		}
-		if host := pageHost(pp); host != "" && host != lastHost {
-			if lastHost != "" {
-				logrus.Infof("页面主机变化：%s -> %s", lastHost, host)
-			}
-			lastHost = host
-		}
+		noteHost()
 		view, err := observeLogin(pp)
+		noteHost()
 		if err != nil {
 			if ctx.Err() != nil {
 				logrus.Infof("等待扫码确认结束：%s，最后状态=%s", ctx.Err(), lastKind)
@@ -308,21 +308,6 @@ func (a *LoginAction) WaitForLogin(ctx context.Context) (bool, error) {
 			case loginKindBlocked:
 				logrus.Infof("登录等待停止：%v", view.Err)
 				return false, view.Err
-			case loginKindDialog, loginKindExpired:
-				sawLoginUI = true
-				dialogGoneAt = time.Time{}
-			default:
-				if sawLoginUI && !rechecked {
-					if dialogGoneAt.IsZero() {
-						dialogGoneAt = time.Now()
-					} else if time.Since(dialogGoneAt) >= loginRecheckAfter {
-						rechecked = true
-						logrus.Info("登录框已关闭且未见账号入口，重新打开首页核对")
-						if err := navigateExplore(pp); err != nil {
-							logrus.Infof("重新打开首页失败：%v", err)
-						}
-					}
-				}
 			}
 		}
 		select {
